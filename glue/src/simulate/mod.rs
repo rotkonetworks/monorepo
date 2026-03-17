@@ -13,8 +13,10 @@
 //! - [`ProgressTracker`]: Monitors finalization progress and agreement.
 
 pub mod engine;
+pub mod exit;
 pub mod fault;
 pub mod plan;
+pub mod processed;
 pub mod property;
 pub mod reporter;
 pub mod team;

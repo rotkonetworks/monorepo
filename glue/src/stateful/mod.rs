@@ -29,27 +29,6 @@
 //! then replays forward via [`Application::replay`] to fill the gap. Each
 //! replayed block is inserted into the pending map immediately so that
 //! partial progress survives timeouts.
-//!
-//! # TODO
-//!
-//! - Implement the [`db`] traits across `commonware-storage`'s QMDBs. This
-//!   requires two changes to the QMDB API:
-//!   1. Remove the `'a` lifetime from batch types. Today, `MerkleizedBatch`
-//!      and `UnmerkleizedBatch` borrow the database (`&'a Db`), which prevents
-//!      storing them as owned values in the `pending` map. Batches must become
-//!      owned (`Send + 'static`) types.
-//!   2. Type-erase the parent parameter `P`. QMDB batch types are generic
-//!      over their parent (`P`), and the concrete type changes at every chain
-//!      depth: a DB-rooted batch has `P = Mmr<...>`, a chained batch has
-//!      `P = MerkleizedBatch<..., Mmr<...>>`, a grandchild nests further, etc.
-//!      This means `db.new_batch()` and `merkleized.new_batch()` return
-//!      different concrete types, violating the
-//!      [`Merkleized<Unmerkleized = Self::Unmerkleized>`](db::Merkleized)
-//!      constraint on [`ManagedDb`](db::ManagedDb). The fix
-//!      is to erase `P` behind a trait object or enum so that all chain depths
-//!      share one concrete batch type. The cost is one dynamic dispatch per
-//!      `get()` that falls through to a parent -- negligible compared to
-//!      storage I/O.
 
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
@@ -61,7 +40,7 @@ use db::DatabaseSet;
 use rand::Rng;
 use std::future::Future;
 
-pub mod actor;
+mod actor;
 pub use actor::{Config, Mailbox, Stateful};
 
 pub mod db;
@@ -95,7 +74,7 @@ where
     ///
     /// Must implement [`CertifiableBlock`] so the wrapper can extract
     /// the consensus context during lazy recovery (see
-    /// [`replay`](Self::replay)).
+    /// [`apply`](Self::apply)).
     type Block: CertifiableBlock<Context = Self::Context>;
 
     /// The set of databases managed on behalf of this application.
@@ -114,6 +93,10 @@ where
     /// Build a new block on top of the provided parent ancestry.
     ///
     /// Returns [`None`] if the build fails.
+    ///
+    /// This future may be cancelled by consensus if the caller drops its
+    /// response receiver. Implementations should be cancellation-safe: dropping
+    /// and retrying must not violate invariants or lose durable progress.
     fn propose<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         context: (E, Self::Context),
@@ -128,6 +111,10 @@ where
     /// against the provided batches and merkleize them. Returns [`None`]
     /// only when the block is permanently invalid; if validity may still
     /// change as additional information arrives, continue waiting.
+    ///
+    /// This future may be cancelled by consensus if the caller drops its
+    /// response receiver. Implementations should be cancellation-safe: dropping
+    /// and retrying must not violate invariants or lose durable progress.
     fn verify<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         context: (E, Self::Context),
@@ -135,19 +122,22 @@ where
         batches: <Self::Databases as DatabaseSet>::Unmerkleized,
     ) -> impl Future<Output = Option<<Self::Databases as DatabaseSet>::Merkleized>> + Send;
 
-    /// Re-execute a previously certified block to reconstruct its
-    /// merkleized state.
+    /// Apply a previously certified block to reconstruct its merkleized state.
     ///
     /// Called by the wrapper during lazy recovery when pending state for
     /// an ancestor block is missing (e.g. after a restart). The block is
     /// known-good (it was previously certified), so the implementation
     /// should unconditionally execute the block's state transitions.
     ///
+    /// This future may be cancelled if the originating propose/verify request
+    /// is dropped. Implementations should be cancellation-safe: dropping and
+    /// retrying must not violate invariants or lose durable progress.
+    ///
     /// # Panics
     ///
     /// Implementations should panic if execution fails, as this indicates
     /// data corruption or non-determinism.
-    fn replay(
+    fn apply(
         &mut self,
         context: (E, Self::Context),
         block: &Self::Block,

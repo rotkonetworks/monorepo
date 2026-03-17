@@ -43,8 +43,7 @@ pub trait BlockProvider: Clone + Send + 'static {
 /// a channel.
 #[derive(Clone)]
 pub struct ErasedBlockProvider<B: Block> {
-    fetch:
-        Arc<dyn Fn(<B as Digestible>::Digest) -> BoxFuture<'static, Option<B>> + Send + Sync>,
+    fetch: Arc<dyn Fn(<B as Digestible>::Digest) -> BoxFuture<'static, Option<B>> + Send + Sync>,
 }
 
 impl<B: Block> ErasedBlockProvider<B> {

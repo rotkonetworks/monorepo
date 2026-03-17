@@ -13,11 +13,13 @@ repository = "https://github.com/commonwarexyz/monorepo/tree/main/glue"
 workspace = true
 
 [dependencies]
+commonware-codec.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography.workspace = true
 commonware-macros.workspace = true
 commonware-p2p = { workspace = true, optional = true }
 commonware-runtime.workspace = true
+commonware-storage.workspace = true
 commonware-utils.workspace = true
 futures.workspace = true
 rand.workspace = true

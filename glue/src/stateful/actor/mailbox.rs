@@ -6,20 +6,18 @@ use commonware_consensus::{
         ancestry::{AncestorStream, BlockProvider, ErasedBlockProvider},
         Update,
     },
-    types::Round,
     Application as ConsensusApplication, Reporter,
     VerifyingApplication as ConsensusVerifyingApplication,
 };
-use commonware_cryptography::Digestible;
 use commonware_runtime::{Clock, Metrics, Spawner};
 use commonware_utils::{
+    acknowledgement::Exact,
     channel::{fallible::AsyncFallibleExt, mpsc, oneshot},
-    Acknowledgement,
 };
 use rand::Rng;
 
 /// Type alias for an ancestor stream with an erased block provider.
-pub type ErasedAncestorStream<B> = AncestorStream<ErasedBlockProvider<B>, B>;
+pub(crate) type ErasedAncestorStream<B> = AncestorStream<ErasedBlockProvider<B>, B>;
 
 /// Messages processed by the actor loop.
 pub(crate) enum Message<E, A>
@@ -44,10 +42,10 @@ where
         response: oneshot::Sender<bool>,
     },
 
-    /// A reporting of a new finalized tip.
+    /// A reporting of a new finalized block.
     Finalized {
-        round: Round,
-        digest: <A::Block as Digestible>::Digest,
+        block: A::Block,
+        acknowledgement: Exact,
     },
 }
 
@@ -156,12 +154,15 @@ where
 
     async fn report(&mut self, activity: Self::Activity) {
         match activity {
-            Update::Tip(round, _, digest) => {
+            Update::Tip(_, _, _) => {}
+            Update::Block(block, acknowledgement) => {
                 self.sender
-                    .send_lossy(Message::Finalized { round, digest })
+                    .send_lossy(Message::Finalized {
+                        block,
+                        acknowledgement,
+                    })
                     .await;
             }
-            Update::Block(_, ack) => ack.acknowledge(),
         }
     }
 }

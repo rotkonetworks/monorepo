@@ -1,19 +1,16 @@
-use super::db::MockDb;
 use crate::{
     simulate::{
         engine::{EngineDefinition, InitContext},
+        processed::ProcessedHeight,
         reporter::MonitorReporter,
     },
     stateful::{
         db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
-        Application, Config as StatefulConfig, Mailbox as StatefulMailbox,
-        Stateful as StatefulActor,
+        Application, Config as StatefulConfig, Stateful as StatefulActor,
     },
 };
 use commonware_broadcast::buffered;
-use commonware_codec::{
-    Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt as _, Write,
-};
+use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
 use commonware_consensus::{
     marshal::{
         self,
@@ -21,7 +18,6 @@ use commonware_consensus::{
         core::Actor as MarshalActor,
         resolver::p2p as marshal_resolver,
         standard::{Deferred, Standard},
-        Update,
     },
     simplex::{
         self,
@@ -31,7 +27,7 @@ use commonware_consensus::{
         types::Context,
     },
     types::{Epoch, FixedEpocher, Height, Round, View, ViewDelta},
-    Block as ConsensusBlock, CertifiableBlock, Heightable, Reporter, Reporters,
+    Block as ConsensusBlock, CertifiableBlock, Heightable,
 };
 use commonware_cryptography::{
     certificate::{mocks::Fixture, ConstantProvider, Scheme as _},
@@ -41,21 +37,76 @@ use commonware_parallel::Sequential;
 use commonware_runtime::{
     buffer::paged::CacheRef, deterministic, Buf, BufMut, Clock, Handle, Metrics, Quota, Spawner,
 };
-use commonware_storage::archive::immutable;
-use commonware_utils::{sync::AsyncRwLock, test_rng, Acknowledgement as _, NZUsize, NZU16, NZU64};
+use commonware_storage::{
+    archive::immutable,
+    qmdb::any::{unordered::fixed, FixedConfig},
+    translator::TwoCap,
+};
+use commonware_utils::{sync::AsyncRwLock, test_rng, NZUsize, NZU16, NZU64};
 use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     sync::Arc,
     time::Duration,
 };
 
-const BLOCKS_PER_EPOCH: NonZeroU64 = NZU64!(20);
+const EPOCH_LENGTH: NonZeroU64 = NZU64!(u64::MAX);
 const NAMESPACE: &[u8] = b"stateful_e2e_test";
 const PAGE_SIZE: NonZeroU16 = NZU16!(1024);
 const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(10);
 const TEST_QUOTA: Quota = Quota::per_second(NonZeroU32::MAX);
 
-pub(crate) type MockDatabaseSet = Arc<AsyncRwLock<MockDb>>;
+/// The QMDB database type used by the e2e tests.
+type Qmdb = fixed::Db<deterministic::Context, sha256::Digest, sha256::Digest, Sha256, TwoCap>;
+
+pub(crate) type MockDatabaseSet = Arc<AsyncRwLock<Qmdb>>;
+type MarshalMailbox = marshal::core::Mailbox<MockScheme<ed25519::PublicKey>, Standard<Block>>;
+
+#[derive(Clone)]
+pub(crate) struct MockValidatorState {
+    _db: MockDatabaseSet,
+    marshal: MarshalMailbox,
+}
+
+impl MockValidatorState {
+    pub(crate) async fn digest_at_height(&self, height: u64) -> Option<sha256::Digest> {
+        self.marshal
+            .get_info(marshal::Identifier::Height(Height::new(height)))
+            .await
+            .map(|(_, digest)| digest)
+    }
+}
+
+impl ProcessedHeight for MockValidatorState {
+    async fn processed_height(&self) -> u64 {
+        self.marshal
+            .get_processed_height()
+            .await
+            .map_or(0, |height| height.get())
+    }
+}
+
+/// Deterministic key for the block counter.
+fn counter_key() -> sha256::Digest {
+    Sha256::hash(b"counter")
+}
+
+/// Deterministic key for a height marker.
+fn height_key(height: u64) -> sha256::Digest {
+    Sha256::hash(&height.to_be_bytes())
+}
+
+/// Encode a u64 as a digest (zero-padded).
+fn u64_to_digest(v: u64) -> sha256::Digest {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&v.to_be_bytes());
+    sha256::Digest::from(bytes)
+}
+
+/// Decode a u64 from a digest (first 8 bytes).
+fn digest_to_u64(d: &sha256::Digest) -> u64 {
+    let bytes: &[u8] = d.as_ref();
+    u64::from_be_bytes(bytes[..8].try_into().unwrap())
+}
 
 /// A block carrying key-value mutations with embedded consensus context.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +116,6 @@ pub(crate) struct Block {
     height: Height,
     digest: sha256::Digest,
     state_root: sha256::Digest,
-    writes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Write for Block {
@@ -75,7 +125,6 @@ impl Write for Block {
         self.height.write(buf);
         self.digest.write(buf);
         self.state_root.write(buf);
-        self.writes.write(buf);
     }
 }
 
@@ -86,7 +135,6 @@ impl EncodeSize for Block {
             + self.height.encode_size()
             + self.digest.encode_size()
             + self.state_root.encode_size()
-            + self.writes.encode_size()
     }
 }
 
@@ -99,17 +147,12 @@ impl Read for Block {
         let height = Height::read(buf)?;
         let digest = sha256::Digest::read(buf)?;
         let state_root = sha256::Digest::read(buf)?;
-        let unbounded: RangeCfg<usize> = (..).into();
-        let byte_vec_cfg = (unbounded, ());
-        let writes_cfg = (unbounded, (byte_vec_cfg, byte_vec_cfg));
-        let writes = Vec::read_cfg(buf, &writes_cfg)?;
         Ok(Self {
             context,
             parent,
             height,
             digest,
             state_root,
-            writes,
         })
     }
 }
@@ -155,10 +198,8 @@ impl Block {
             height: Height::zero(),
             digest,
             state_root: sha256::Digest::EMPTY,
-            writes: Vec::new(),
         }
     }
-
 }
 
 /// A stateful application that increments a counter each block.
@@ -174,36 +215,24 @@ impl App {
         }
     }
 
-    /// Execute a block: increment "counter" and write `height -> height_bytes`.
+    /// Execute a block: increment "counter" and write `height -> height_val`.
     async fn execute(
         height: Height,
         mut batches: <MockDatabaseSet as DatabaseSet>::Unmerkleized,
-    ) -> (
-        Vec<(Vec<u8>, Vec<u8>)>,
-        <MockDatabaseSet as DatabaseSet>::Merkleized,
-    ) {
+    ) -> <MockDatabaseSet as DatabaseSet>::Merkleized {
         // Read current counter
-        let counter_key = b"counter".to_vec();
         let current: u64 = batches
-            .get(&counter_key)
+            .get(&counter_key())
             .await
             .unwrap()
-            .map_or(0, |v| u64::from_be_bytes(v.try_into().unwrap()));
+            .map_or(0, |v| digest_to_u64(&v));
         let next = current + 1;
-        batches = batches.write(counter_key.clone(), Some(next.to_be_bytes().to_vec()));
+        batches = batches.write(counter_key(), Some(u64_to_digest(next)));
 
         // Write height marker
-        let height_key = format!("height_{}", height.get()).into_bytes();
-        let height_val = height.get().to_be_bytes().to_vec();
-        batches = batches.write(height_key.clone(), Some(height_val.clone()));
+        batches = batches.write(height_key(height.get()), Some(u64_to_digest(height.get())));
 
-        let writes = vec![
-            (counter_key, next.to_be_bytes().to_vec()),
-            (height_key, height_val),
-        ];
-
-        let merkleized = batches.merkleize().await.unwrap();
-        (writes, merkleized)
+        batches.merkleize().await.unwrap()
     }
 }
 
@@ -233,12 +262,9 @@ where
         let height = Height::new(parent.height().get() + 1);
         let (_, ctx) = &context;
 
-        let (writes, merkleized) = Self::execute(height, batches).await;
+        let merkleized = Self::execute(height, batches).await;
         let state_root = merkleized.root();
 
-        // Compute block digest from context, parent, height, state_root.
-        // Including the context ensures different proposals at different views
-        // produce different digests (required by Deferred's context check).
         let mut hasher = Sha256::new();
         hasher.update(b"e2e_block");
         hasher.update(&ctx.encode());
@@ -253,7 +279,6 @@ where
             height,
             digest,
             state_root,
-            writes,
         };
         Some((block, merkleized))
     }
@@ -267,7 +292,7 @@ where
         let tip = ancestry.peek()?;
         let height = tip.height();
 
-        let (_, merkleized) = Self::execute(height, batches).await;
+        let merkleized = Self::execute(height, batches).await;
         let computed_root = merkleized.root();
 
         if computed_root != tip.state_root {
@@ -277,28 +302,13 @@ where
         Some(merkleized)
     }
 
-    async fn replay(
+    async fn apply(
         &mut self,
         _context: (E, Self::Context),
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet>::Merkleized {
-        let (_, merkleized) = Self::execute(block.height(), batches).await;
-        merkleized
-    }
-}
-
-/// Acknowledges marshal `Update::Block` events.
-#[derive(Clone)]
-struct AckReporter;
-
-impl Reporter for AckReporter {
-    type Activity = Update<Block>;
-
-    async fn report(&mut self, activity: Self::Activity) {
-        if let Update::Block(_, ack) = activity {
-            ack.acknowledge();
-        }
+        Self::execute(block.height(), batches).await
     }
 }
 
@@ -307,7 +317,6 @@ impl Reporter for AckReporter {
 pub(crate) struct ConsensusEngine {
     participants: Vec<ed25519::PublicKey>,
     schemes: Vec<MockScheme<ed25519::PublicKey>>,
-    pub(crate) databases: Vec<MockDatabaseSet>,
 }
 
 impl ConsensusEngine {
@@ -319,14 +328,9 @@ impl ConsensusEngine {
             ..
         } = scheme_mocks::fixture(&mut rng, NAMESPACE, n);
 
-        let databases = (0..n)
-            .map(|_| Arc::new(AsyncRwLock::new(MockDb::default())))
-            .collect();
-
         Self {
             participants,
             schemes,
-            databases,
         }
     }
 }
@@ -334,7 +338,7 @@ impl ConsensusEngine {
 impl EngineDefinition for ConsensusEngine {
     type PublicKey = ed25519::PublicKey;
     type Engine = Handle<()>;
-    type State = MockDatabaseSet;
+    type State = MockValidatorState;
 
     fn participants(&self) -> Vec<Self::PublicKey> {
         self.participants.clone()
@@ -361,12 +365,30 @@ impl EngineDefinition for ConsensusEngine {
             monitor,
         } = ctx;
 
-        let db = self.databases[index].clone();
         let scheme = self.schemes[index].clone();
 
         let partition_prefix = format!("validator-{index}");
         let page_cache = CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE);
 
+        // Initialize QMDB database
+        let qmdb = Qmdb::init(
+            context.clone(),
+            FixedConfig {
+                mmr_journal_partition: format!("{partition_prefix}-qmdb-mmr-journal"),
+                mmr_metadata_partition: format!("{partition_prefix}-qmdb-mmr-metadata"),
+                mmr_items_per_blob: NZU64!(11),
+                mmr_write_buffer: NZUsize!(1024),
+                log_journal_partition: format!("{partition_prefix}-qmdb-log-journal"),
+                log_items_per_blob: NZU64!(7),
+                log_write_buffer: NZUsize!(1024),
+                translator: TwoCap::default(),
+                thread_pool: None,
+                page_cache: page_cache.clone(),
+            },
+        )
+        .await
+        .expect("failed to initialize QMDB");
+        let db: MockDatabaseSet = Arc::new(AsyncRwLock::new(qmdb));
         // Destructure the 5 channels
         let mut channels = channels.into_iter();
         let vote_network = channels.next().unwrap();
@@ -457,7 +479,7 @@ impl EngineDefinition for ConsensusEngine {
         let provider = ConstantProvider::new(scheme.clone());
         let marshal_config = marshal::Config {
             provider,
-            epocher: FixedEpocher::new(BLOCKS_PER_EPOCH),
+            epocher: FixedEpocher::new(EPOCH_LENGTH),
             partition_prefix: partition_prefix.clone(),
             mailbox_size: 100,
             view_retention_timeout: ViewDelta::new(10),
@@ -488,34 +510,27 @@ impl EngineDefinition for ConsensusEngine {
                 app,
                 databases: db.clone(),
                 input_provider: (),
-                block_provider: marshal_mailbox.clone(),
+                marshal: marshal_mailbox.clone(),
+                mailbox_size: 100,
             },
         );
-        stateful_actor.start();
 
-        // Deferred wrapper -- uses the mailbox as the consensus application
+        // Deferred wrapper
         let deferred = Deferred::new(
             context.clone(),
             stateful_mailbox.clone(),
             marshal_mailbox.clone(),
-            FixedEpocher::new(BLOCKS_PER_EPOCH),
+            FixedEpocher::new(EPOCH_LENGTH),
         );
 
-        // Marshal reporters: ack + stateful mailbox, wrapped by monitor.
-        // The monitor intercepts Update::Tip so the harness counts
-        // finalizations only after marshal has delivered them -- ensuring
-        // the stateful actor has received the finalization before the
-        // harness declares completion.
-        let inner_reporters: Reporters<
-            Update<Block>,
-            AckReporter,
-            StatefulMailbox<deterministic::Context, App>,
-        > = Reporters::from((AckReporter, stateful_mailbox));
-        let marshal_reporters =
-            MonitorReporter::new(public_key.clone(), monitor, inner_reporters);
+        // Marshal reporter: stateful mailbox, wrapped by monitor.
+        let marshal_reporters = MonitorReporter::new(public_key.clone(), monitor, stateful_mailbox);
 
         // Start marshal actor with monitored reporters.
         marshal_actor.start(marshal_reporters, buffer, resolver);
+
+        // Initialize stateful from marshal's processed frontier.
+        stateful_actor.start().await;
 
         // Simplex engine
         let simplex_config = simplex::Config {
@@ -524,7 +539,7 @@ impl EngineDefinition for ConsensusEngine {
             blocker: oracle.control(public_key.clone()),
             automaton: deferred.clone(),
             relay: deferred,
-            reporter: marshal_mailbox,
+            reporter: marshal_mailbox.clone(),
             strategy: Sequential,
             partition: format!("{partition_prefix}-simplex"),
             mailbox_size: 100,
@@ -545,7 +560,13 @@ impl EngineDefinition for ConsensusEngine {
         let engine = simplex::Engine::new(context, simplex_config);
         let handle = engine.start(vote_network, certificate_network, resolver_network);
 
-        (handle, db)
+        (
+            handle,
+            MockValidatorState {
+                _db: db,
+                marshal: marshal_mailbox,
+            },
+        )
     }
 
     fn start(engine: Self::Engine) -> Handle<()> {

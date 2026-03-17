@@ -24,7 +24,7 @@
 //! partial progress survives timeouts.
 
 mod mailbox;
-pub use mailbox::{ErasedAncestorStream, Mailbox};
+pub use mailbox::Mailbox;
 
 mod core;
 pub use core::{Config, Stateful};

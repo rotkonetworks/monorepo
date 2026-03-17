@@ -82,6 +82,11 @@ pub trait Merkleized: Sized + Send + Sync {
 /// unmerkleized batches from committed state and how to persist a
 /// finalized changeset. Child batches (forked from pending state) are
 /// created via [`Merkleized::new_batch`] instead.
+///
+/// [`new_batch`](Self::new_batch) receives the outer
+/// `Arc<AsyncRwLock<Self>>` so that implementations whose batch types
+/// need read-through access to committed state (e.g. QMDB) can
+/// capture the reference.
 pub trait ManagedDb: Send + Sync {
     /// An in-progress batch of mutations that has not yet been merkleized.
     type Unmerkleized: Unmerkleized;
@@ -99,8 +104,10 @@ pub trait ManagedDb: Send + Sync {
     /// Create a new unmerkleized batch rooted at the database's committed
     /// state.
     ///
-    /// In QMDB, this maps to `db.new_batch()`.
-    fn new_batch(&self) -> Self::Unmerkleized;
+    /// The `db` parameter is the `Arc<AsyncRwLock<Self>>` that wraps this
+    /// database, allowing batch types to capture a shared reference for
+    /// read-through to committed state.
+    fn new_batch(db: &Arc<AsyncRwLock<Self>>) -> impl Future<Output = Self::Unmerkleized> + Send;
 
     /// Apply a merkleized batch's changeset to the underlying database.
     ///
@@ -167,7 +174,7 @@ impl<T: ManagedDb + 'static> DatabaseSet for Arc<AsyncRwLock<T>> {
     type Merkleized = T::Merkleized;
 
     async fn new_batches(&self) -> Self::Unmerkleized {
-        self.read().await.new_batch()
+        T::new_batch(self).await
     }
 
     fn fork_batches(parent: &Self::Merkleized) -> Self::Unmerkleized {
@@ -191,7 +198,7 @@ macro_rules! impl_database_set {
             type Merkleized = ($($T::Merkleized,)+);
 
             async fn new_batches(&self) -> Self::Unmerkleized {
-                join!($(async { self.$idx.read().await.new_batch() },)+)
+                join!($($T::new_batch(&self.$idx),)+)
             }
 
             fn fork_batches(parent: &Self::Merkleized) -> Self::Unmerkleized {
@@ -272,7 +279,8 @@ mod tests {
         type Merkleized = TestMerkleized;
         type Error = Infallible;
 
-        fn new_batch(&self) -> Self::Unmerkleized {
+        async fn new_batch(db: &Arc<AsyncRwLock<Self>>) -> Self::Unmerkleized {
+            let _guard = db.read().await;
             TestUnmerkleized
         }
 
@@ -305,7 +313,7 @@ mod tests {
         type Merkleized = TestMerkleized;
         type Error = TestFinalizeError;
 
-        fn new_batch(&self) -> Self::Unmerkleized {
+        async fn new_batch(_db: &Arc<AsyncRwLock<Self>>) -> Self::Unmerkleized {
             TestUnmerkleized
         }
 
@@ -319,7 +327,7 @@ mod tests {
         type Merkleized = TestMerkleized;
         type Error = Infallible;
 
-        fn new_batch(&self) -> Self::Unmerkleized {
+        async fn new_batch(_db: &Arc<AsyncRwLock<Self>>) -> Self::Unmerkleized {
             TestUnmerkleized
         }
 

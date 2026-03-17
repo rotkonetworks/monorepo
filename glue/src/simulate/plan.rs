@@ -2,16 +2,20 @@
 
 use super::{
     engine::EngineDefinition,
+    exit::{ExitCondition, MinimumFinalizations},
     fault::{Crash, Fault, Schedule},
-    property::{LivenessProperty, SafetyProperty},
+    property::{FinalizationProperty, Property},
     team::Team,
     tracker::{FinalizationUpdate, ProgressTracker},
 };
 use commonware_cryptography::PublicKey;
 use commonware_macros::select_loop;
-use commonware_p2p::simulated::{self, Link, LinkSelector, Network};
+use commonware_p2p::{
+    simulated::{self, Link, LinkSelector, Network},
+    Manager as _,
+};
 use commonware_runtime::{deterministic, Clock, Metrics, Runner as _, Spawner};
-use commonware_utils::channel::mpsc;
+use commonware_utils::{channel::mpsc, TryCollect};
 use rand::seq::SliceRandom;
 use std::{
     collections::HashSet,
@@ -21,7 +25,7 @@ use std::{
     },
     time::Duration,
 };
-use tracing::info;
+use tracing::{error, info};
 
 /// Command sent from the fault scheduler to the select loop.
 enum ScheduleCmd<P: PublicKey> {
@@ -71,16 +75,21 @@ pub struct Plan<D: EngineDefinition> {
     pub faults: Vec<Crash<D::PublicKey>>,
 
     /// Number of finalizations required before the simulation stops.
+    ///
+    /// Used by the default exit condition when no custom condition is set.
     pub required_finalizations: u64,
+
+    /// Exit condition that determines when the simulation should terminate.
+    pub exit_condition: Box<dyn ExitCondition<D::PublicKey, D::State>>,
 
     /// Maximum simulation wall-clock time (deterministic time).
     pub timeout: Duration,
 
-    /// Safety properties checked after each finalization.
-    pub safety: Vec<Box<dyn SafetyProperty<D::State>>>,
+    /// Properties checked after each finalization.
+    pub finalization_property: Vec<Box<dyn FinalizationProperty<D::State>>>,
 
-    /// Liveness properties checked at simulation end.
-    pub liveness: Vec<Box<dyn LivenessProperty<D::PublicKey>>>,
+    /// Properties checked once at simulation end with state and tracker access.
+    pub property: Vec<Box<dyn Property<D::PublicKey, D::State>>>,
 }
 
 /// Builder for constructing a [`Plan`] with sensible defaults.
@@ -95,9 +104,10 @@ pub struct PlanBuilder<D: EngineDefinition> {
     engine: D,
     faults: Vec<Crash<D::PublicKey>>,
     required_finalizations: u64,
+    exit_condition: Option<Box<dyn ExitCondition<D::PublicKey, D::State>>>,
     timeout: Duration,
-    safety: Vec<Box<dyn SafetyProperty<D::State>>>,
-    liveness: Vec<Box<dyn LivenessProperty<D::PublicKey>>>,
+    finalization_property: Vec<Box<dyn FinalizationProperty<D::State>>>,
+    property: Vec<Box<dyn Property<D::PublicKey, D::State>>>,
 }
 
 impl<D: EngineDefinition> PlanBuilder<D> {
@@ -123,9 +133,10 @@ impl<D: EngineDefinition> PlanBuilder<D> {
             engine,
             faults: vec![],
             required_finalizations: 10,
+            exit_condition: None,
             timeout: Duration::from_secs(120),
-            safety: vec![],
-            liveness: vec![],
+            finalization_property: vec![],
+            property: vec![],
         }
     }
 
@@ -171,23 +182,38 @@ impl<D: EngineDefinition> PlanBuilder<D> {
         self
     }
 
+    /// Override the default exit condition.
+    pub fn exit_condition(
+        mut self,
+        condition: impl ExitCondition<D::PublicKey, D::State> + 'static,
+    ) -> Self {
+        self.exit_condition = Some(Box::new(condition));
+        self
+    }
+
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    pub fn safety(mut self, property: impl SafetyProperty<D::State> + 'static) -> Self {
-        self.safety.push(Box::new(property));
+    pub fn finalization_property(
+        mut self,
+        property: impl FinalizationProperty<D::State> + 'static,
+    ) -> Self {
+        self.finalization_property.push(Box::new(property));
         self
     }
 
-    pub fn liveness(mut self, property: impl LivenessProperty<D::PublicKey> + 'static) -> Self {
-        self.liveness.push(Box::new(property));
+    pub fn property(mut self, property: impl Property<D::PublicKey, D::State> + 'static) -> Self {
+        self.property.push(Box::new(property));
         self
     }
 
     /// Build the [`Plan`].
     pub fn build(self) -> Plan<D> {
+        let exit_condition = self
+            .exit_condition
+            .unwrap_or_else(|| Box::new(MinimumFinalizations::new(self.required_finalizations)));
         Plan {
             seed: self.seed,
             participants: self.participants,
@@ -196,9 +222,10 @@ impl<D: EngineDefinition> PlanBuilder<D> {
             engine: self.engine,
             faults: self.faults,
             required_finalizations: self.required_finalizations,
+            exit_condition,
             timeout: self.timeout,
-            safety: self.safety,
-            liveness: self.liveness,
+            finalization_property: self.finalization_property,
+            property: self.property,
         }
     }
 
@@ -250,10 +277,23 @@ impl<D: EngineDefinition> Plan<D> {
             simulated::Config {
                 max_size: self.max_message_size,
                 disconnect_on_block: true,
-                tracked_peer_sets: None,
+                tracked_peer_sets: Some(3),
             },
         );
         network.start();
+
+        // Seed initial peers so resolver subscriptions can reconcile immediately.
+        let mut manager = oracle.manager();
+        manager
+            .track(
+                0,
+                self.participants
+                    .iter()
+                    .cloned()
+                    .try_collect()
+                    .expect("participants must be unique"),
+            )
+            .await;
 
         let total = self.participants.len();
         let mut team = Team::new(self.engine.clone(), self.participants.clone());
@@ -312,6 +352,7 @@ impl<D: EngineDefinition> Plan<D> {
         let mut crashes: u64 = 0;
         let mut result: Result<PlanResult<D>, String> =
             Err("simulation stopped before completion".into());
+        const EXIT_POLL: Duration = Duration::from_millis(25);
 
         select_loop! {
             ctx,
@@ -324,36 +365,84 @@ impl<D: EngineDefinition> Plan<D> {
             } => {
                 tracker.observe(update)?;
 
-                // Check safety properties
+                // Check finalization properties
                 let states = team.active_states();
-                for prop in &self.safety {
-                    prop.check(&states).map_err(|e| {
-                        format!("safety violation ({}): {e}", prop.name())
-                    })?;
+                for prop in &self.finalization_property {
+                    match prop.check(&states).await {
+                        Ok(()) => {
+                            info!(
+                                target: "simulator",
+                                property = prop.name(),
+                                "finalization property passed"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                target: "simulator",
+                                property = prop.name(),
+                                error = %e,
+                                "finalization property failed"
+                            );
+                            return Err(format!(
+                                "finalization property violation ({}): {e}",
+                                prop.name()
+                            ));
+                        }
+                    }
                 }
 
-                // Check termination: all active validators finalized enough
+                // Check termination.
                 let target_count = if delayed_started {
                     total
                 } else {
                     active_count
                 };
-                if tracker.all_reached(target_count, self.required_finalizations) {
-                    // Check liveness properties
-                    for prop in &self.liveness {
-                        prop.check(&tracker).map_err(|e| {
-                            format!("liveness violation ({}): {e}", prop.name())
-                        })?;
+                let states = team.active_states();
+                let done = self
+                    .exit_condition
+                    .reached(&tracker, &states, target_count)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "exit condition evaluation failed ({}): {e}",
+                            self.exit_condition.name()
+                        )
+                    })?;
+                if done {
+                    // Check post-run properties
+                    for prop in &self.property {
+                        match prop.check(&tracker, &states).await {
+                            Ok(()) => {
+                                info!(
+                                    target: "simulator",
+                                    property = prop.name(),
+                                    "post-run property passed"
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    target: "simulator",
+                                    property = prop.name(),
+                                    error = %e,
+                                    "post-run property failed"
+                                );
+                                return Err(format!(
+                                    "post-run property violation ({}): {e}",
+                                    prop.name()
+                                ));
+                            }
+                        }
                     }
                     let scheduled_faults_applied = scheduled_faults.load(Ordering::Relaxed);
 
                     info!(
                         target: "simulator",
                         required = self.required_finalizations,
+                        exit_condition = self.exit_condition.name(),
                         crashes,
                         scheduled_faults = scheduled_faults_applied,
                         delayed_started,
-                        "all validators finalized required blocks"
+                        "all validators reached required progress"
                     );
                     result = Ok(PlanResult {
                         state: ctx.auditor().state(),
@@ -383,6 +472,74 @@ impl<D: EngineDefinition> Plan<D> {
                         }
                     }
                 }
+            },
+            _ = ctx.sleep(EXIT_POLL) => {
+                if !self.exit_condition.requires_polling() {
+                    continue;
+                }
+                let target_count = if delayed_started {
+                    total
+                } else {
+                    active_count
+                };
+                let states = team.active_states();
+                let done = self
+                    .exit_condition
+                    .reached(&tracker, &states, target_count)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "exit condition evaluation failed ({}): {e}",
+                            self.exit_condition.name()
+                        )
+                    })?;
+                if !done {
+                    continue;
+                }
+
+                // Check post-run properties
+                for prop in &self.property {
+                    match prop.check(&tracker, &states).await {
+                        Ok(()) => {
+                            info!(
+                                target: "simulator",
+                                property = prop.name(),
+                                "post-run property passed"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                target: "simulator",
+                                property = prop.name(),
+                                error = %e,
+                                "post-run property failed"
+                            );
+                            return Err(format!(
+                                "post-run property violation ({}): {e}",
+                                prop.name()
+                            ));
+                        }
+                    }
+                }
+                let scheduled_faults_applied = scheduled_faults.load(Ordering::Relaxed);
+
+                info!(
+                    target: "simulator",
+                    required = self.required_finalizations,
+                    exit_condition = self.exit_condition.name(),
+                    crashes,
+                    scheduled_faults = scheduled_faults_applied,
+                    delayed_started,
+                    "all validators reached required progress"
+                );
+                result = Ok(PlanResult {
+                    state: ctx.auditor().state(),
+                    tracker,
+                    crashes,
+                    scheduled_faults: scheduled_faults_applied,
+                    delayed_started,
+                });
+                break;
             },
             Some(pk) = restart_rx.recv() else break => {
                 team.restart(&ctx, &oracle, pk, monitor_tx.clone()).await;
@@ -575,7 +732,7 @@ mod tests {
     use commonware_consensus::types::View;
     use commonware_cryptography::{ed25519, Signer as _};
     use commonware_runtime::{Clock, Handle, Quota, Spawner};
-    use std::future::Future;
+    use std::{future::Future, pin::Pin};
 
     #[derive(Clone)]
     struct FinalizingEngine {
@@ -660,6 +817,25 @@ mod tests {
         }
     }
 
+    struct AtLeastTrackedValidators {
+        min: usize,
+    }
+
+    impl ExitCondition<ed25519::PublicKey, ()> for AtLeastTrackedValidators {
+        fn name(&self) -> &str {
+            "at_least_tracked_validators"
+        }
+
+        fn reached<'a>(
+            &'a self,
+            tracker: &'a ProgressTracker<ed25519::PublicKey>,
+            _states: &'a [&'a ()],
+            _target_count: usize,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
+            Box::pin(async move { Ok(tracker.tracked_count() >= self.min) })
+        }
+    }
+
     #[test]
     fn schedule_fault_applied_before_completion_is_counted() {
         let link = Link {
@@ -707,6 +883,22 @@ mod tests {
         assert!(
             result.scheduled_faults >= 1,
             "scheduled faults should still run when delay faults are also configured"
+        );
+    }
+
+    #[test]
+    fn custom_exit_condition_overrides_required_finalizations() {
+        let result = PlanBuilder::new(FinalizingEngine::new(2, Duration::from_millis(10), 1))
+            .required_finalizations(100)
+            .exit_condition(AtLeastTrackedValidators { min: 2 })
+            .timeout(Duration::from_secs(2))
+            .run()
+            .expect("simulation should complete with custom exit condition");
+
+        assert_eq!(
+            result.tracker.tracked_count(),
+            2,
+            "custom exit condition should see both validators"
         );
     }
 }

@@ -91,6 +91,13 @@ impl<P: PublicKey> ProgressTracker<P> {
     pub fn tracked_count(&self) -> usize {
         self.status.len()
     }
+
+    /// Number of unique finalized block digests observed at `view`.
+    pub fn unique_digests_at(&self, view: u64) -> usize {
+        self.digests_by_view
+            .get(&View::new(view))
+            .map_or(0, HashSet::len)
+    }
 }
 
 #[cfg(test)]
