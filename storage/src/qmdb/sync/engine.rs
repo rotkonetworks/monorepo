@@ -19,6 +19,7 @@ use commonware_macros::select;
 use commonware_runtime::Metrics as _;
 use commonware_utils::{channel::mpsc, NZU64};
 use futures::{future::Either, StreamExt};
+use mpsc::error::TryRecvError;
 use std::{collections::BTreeMap, fmt::Debug, num::NonZeroU64};
 
 /// Type alias for sync engine errors
@@ -59,10 +60,14 @@ async fn wait_for_event<Op, D: Digest, E>(
     update_receiver: &mut Option<mpsc::Receiver<Target<D>>>,
     outstanding_requests: &mut Requests<Op, D, E>,
 ) -> Option<Event<Op, D, E>> {
-    let target_update_fut = update_receiver.as_mut().map_or_else(
-        || Either::Right(futures::future::pending()),
-        |update_rx| Either::Left(update_rx.recv()),
-    );
+    let target_update_fut = if outstanding_requests.len() > 0 {
+        Either::Right(futures::future::pending())
+    } else {
+        update_receiver.as_mut().map_or_else(
+            || Either::Right(futures::future::pending()),
+            |update_rx| Either::Left(update_rx.recv()),
+        )
+    };
 
     select! {
         target = target_update_fut => target.map_or_else(
@@ -152,6 +157,10 @@ where
 
     /// Optional receiver for target updates during sync
     update_receiver: Option<mpsc::Receiver<Target<DB::Digest>>>,
+
+    /// Newer target to apply after the current target completes.
+    queued_target: Option<Target<DB::Digest>>,
+
 }
 
 #[cfg(test)]
@@ -203,7 +212,12 @@ where
             context: config.context,
             config: config.db_config,
             update_receiver: config.update_rx,
+            queued_target: None,
         };
+        engine.drain_target_updates()?;
+        if let Some(next_target) = engine.queued_target.take() {
+            engine = engine.reset_for_target_update(next_target).await?;
+        }
         engine.schedule_requests().await?;
         Ok(engine)
     }
@@ -298,7 +312,47 @@ where
             context: self.context,
             config: self.config,
             update_receiver: self.update_receiver,
+            queued_target: self.queued_target,
         })
+    }
+
+    fn enqueue_target_update(
+        &mut self,
+        new_target: Target<DB::Digest>,
+    ) -> Result<(), Error<DB, R>> {
+        // Ignore exact duplicates. Marshal tips are at-least-once.
+        if is_duplicate_target_update(&self.target, &new_target) {
+            return Ok(());
+        }
+
+        // Only allow updates that move the current target forward.
+        validate_update(&self.target, &new_target)?;
+
+        // Keep only the latest queued update.
+        self.queued_target = Some(new_target);
+        Ok(())
+    }
+
+    fn drain_target_updates(&mut self) -> Result<(), Error<DB, R>> {
+        loop {
+            let result = {
+                let Some(update_rx) = self.update_receiver.as_mut() else {
+                    return Ok(());
+                };
+                update_rx.try_recv()
+            };
+
+            match result {
+                Ok(target) => self.enqueue_target_update(target)?,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.update_receiver = None;
+                    break;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Store a batch of fetched operations. If the input list is empty, this is a no-op.
@@ -375,7 +429,7 @@ where
     }
 
     /// Check if sync is complete based on the current journal size and target
-    pub async fn is_complete(&self) -> Result<bool, Error<DB, R>> {
+    pub async fn is_complete(&mut self) -> Result<bool, Error<DB, R>> {
         let journal_size = self.journal.size().await;
         let target_journal_size = self.target.range.end();
 
@@ -482,8 +536,16 @@ where
     /// Returns `StepResult::Complete(database)` when sync is finished, or
     /// `StepResult::Continue(self)` when more work remains.
     pub(crate) async fn step(mut self) -> Result<NextStep<Self, DB>, Error<DB, R>> {
+        self.drain_target_updates()?;
+
         // Check if sync is complete
         if self.is_complete().await? {
+            if let Some(next_target) = self.queued_target.take() {
+                let mut updated_self = self.reset_for_target_update(next_target).await?;
+                updated_self.schedule_requests().await?;
+                return Ok(NextStep::Continue(updated_self));
+            }
+
             self.journal.sync().await?;
 
             // Build the database from the completed sync
@@ -517,21 +579,8 @@ where
 
         match event {
             Event::TargetUpdate(new_target) => {
-                // Ignore duplicate targets. Marshal can report finalizations at-least-once,
-                // and untouched databases may emit identical targets across finalized blocks.
-                if is_duplicate_target_update(&self.target, &new_target) {
-                    return Ok(NextStep::Continue(self));
-                }
-
-                // Validate and handle the target update
-                validate_update(&self.target, &new_target)?;
-
-                let mut updated_self = self.reset_for_target_update(new_target).await?;
-
-                // Schedule new requests for the updated target
-                updated_self.schedule_requests().await?;
-
-                return Ok(NextStep::Continue(updated_self));
+                self.enqueue_target_update(new_target)?;
+                self.drain_target_updates()?;
             }
             Event::UpdateChannelClosed => {
                 self.update_receiver = None;
@@ -545,6 +594,9 @@ where
 
                 // Apply operations that are now contiguous with the current journal
                 self.apply_operations().await?;
+
+                // Coalesce any pending updates after making progress.
+                self.drain_target_updates()?;
             }
         }
 

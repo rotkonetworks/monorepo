@@ -13,11 +13,13 @@ repository = "https://github.com/commonwarexyz/monorepo/tree/main/glue"
 workspace = true
 
 [dependencies]
+bytes.workspace = true
 commonware-codec.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography.workspace = true
 commonware-macros.workspace = true
-commonware-p2p = { workspace = true, optional = true }
+commonware-p2p.workspace = true
+commonware-resolver.workspace = true
 commonware-runtime.workspace = true
 commonware-storage.workspace = true
 commonware-utils.workspace = true
@@ -38,6 +40,4 @@ commonware-storage.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
-test-utils = [
-	"dep:commonware-p2p",
-]
+test-utils = []

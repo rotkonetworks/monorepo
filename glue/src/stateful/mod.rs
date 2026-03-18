@@ -26,7 +26,7 @@
 //! recovers lazily: when `propose` or `verify` encounters a parent whose
 //! state is missing, the wrapper walks back through the block DAG (via a
 //! [`BlockProvider`]) to the nearest known ancestor or the finalized tip,
-//! then replays forward via [`Application::replay`] to fill the gap. Each
+//! then replays forward via [`Application::apply`] to fill the gap. Each
 //! replayed block is inserted into the pending map immediately so that
 //! partial progress survives timeouts.
 
@@ -41,12 +41,17 @@ use rand::Rng;
 use std::future::Future;
 
 mod actor;
-pub use actor::{Config, Mailbox, Stateful};
+pub use actor::{Config, Mailbox, Startup, StateSyncConfig, Stateful};
 
 pub mod db;
 
 #[cfg(test)]
 mod tests;
+
+type ProposedOutput<A, E> = (
+    <A as Application<E>>::Block,
+    <<A as Application<E>>::Databases as DatabaseSet<E>>::Merkleized,
+);
 
 /// A stateful application whose storage is managed by a [`DatabaseSet`].
 ///
@@ -78,7 +83,7 @@ where
     type Block: CertifiableBlock<Context = Self::Context>;
 
     /// The set of databases managed on behalf of this application.
-    type Databases: DatabaseSet;
+    type Databases: DatabaseSet<E>;
 
     /// A provider of input to the application.
     ///
@@ -101,9 +106,9 @@ where
         &mut self,
         context: (E, Self::Context),
         ancestry: AncestorStream<A, Self::Block>,
-        batches: <Self::Databases as DatabaseSet>::Unmerkleized,
+        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
-    ) -> impl Future<Output = Option<(Self::Block, <Self::Databases as DatabaseSet>::Merkleized)>> + Send;
+    ) -> impl Future<Output = Option<ProposedOutput<Self, E>>> + Send;
 
     /// Verify a block received from a peer, relative to its ancestry.
     ///
@@ -119,8 +124,8 @@ where
         &mut self,
         context: (E, Self::Context),
         ancestry: AncestorStream<A, Self::Block>,
-        batches: <Self::Databases as DatabaseSet>::Unmerkleized,
-    ) -> impl Future<Output = Option<<Self::Databases as DatabaseSet>::Merkleized>> + Send;
+        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
+    ) -> impl Future<Output = Option<<Self::Databases as DatabaseSet<E>>::Merkleized>> + Send;
 
     /// Apply a previously certified block to reconstruct its merkleized state.
     ///
@@ -141,6 +146,14 @@ where
         &mut self,
         context: (E, Self::Context),
         block: &Self::Block,
-        batches: <Self::Databases as DatabaseSet>::Unmerkleized,
-    ) -> impl Future<Output = <Self::Databases as DatabaseSet>::Merkleized> + Send;
+        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
+    ) -> impl Future<Output = <Self::Databases as DatabaseSet<E>>::Merkleized> + Send;
+
+    /// Extract per-database sync targets from a finalized block.
+    ///
+    /// Called by the wrapper when a [`Update::Tip`](commonware_consensus::marshal::Update::Tip)
+    /// is received during state sync. The returned targets are forwarded to
+    /// the background sync orchestrator so the sync engines can track the
+    /// latest finalized state root and range.
+    fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets;
 }

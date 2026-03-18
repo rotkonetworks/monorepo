@@ -1,9 +1,8 @@
 //! Consensus-facing wrapper that manages pending state on behalf of a
 //! stateful application.
 //!
-//! [`Stateful`] implements the consensus [`Application`](ConsensusApplication)
-//! and [`VerifyingApplication`](ConsensusVerifyingApplication) traits by
-//! delegating execution to the inner [`Application`] while managing the
+//! `Stateful` implements the consensus application and verifying traits by
+//! delegating execution to the inner application while managing the
 //! pending-tip DAG of merkleized batches:
 //!
 //! - Before each `propose` or `verify`, the wrapper forks unmerkleized
@@ -19,7 +18,7 @@
 //! Pending state lives entirely in memory. After a restart the map is empty,
 //! but the wrapper recovers lazily: when a parent's state is missing, it
 //! walks back through the block DAG via a [`BlockProvider`] to the nearest
-//! known ancestor, then replays forward via [`Application::replay`]. Each
+//! known ancestor, then replays forward via [`Application::apply`]. Each
 //! replayed block is inserted into the pending map immediately so that
 //! partial progress survives timeouts.
 //!
@@ -29,10 +28,11 @@
 
 use crate::stateful::{
     actor::{
+        bootstrap::{bootstrap, BootstrapConfig, Startup as BootstrapStartup, SyncTip},
         mailbox::{ErasedAncestorStream, Message},
         Mailbox,
     },
-    db::DatabaseSet,
+    db::{qmdb::resolver::AttachableResolverSet, DatabaseSet, StateSyncSet},
     Application,
 };
 use commonware_consensus::{
@@ -42,7 +42,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{certificate::Scheme, Digestible};
 use commonware_macros::{select, select_loop};
-use commonware_runtime::{spawn_cell, Clock, ContextCell, Handle, Metrics, Spawner};
+use commonware_runtime::{spawn_cell, Clock, ContextCell, Handle, Metrics, Spawner, Storage};
 use commonware_utils::{
     acknowledgement::Exact,
     channel::{fallible::OneshotExt, mpsc, oneshot},
@@ -53,8 +53,46 @@ use std::{collections::HashMap, future::Future};
 use tracing::{debug, info};
 
 type PendingDigest<A, E> = <<A as Application<E>>::Block as Digestible>::Digest;
-type PendingBatches<A, E> = <<A as Application<E>>::Databases as DatabaseSet>::Merkleized;
+type PendingBatches<A, E> = <<A as Application<E>>::Databases as DatabaseSet<E>>::Merkleized;
 type PendingEntry<A, E> = (Round, PendingBatches<A, E>);
+type PendingSyncTip<A, E> = SyncTip<
+    <<A as Application<E>>::Databases as DatabaseSet<E>>::SyncTargets,
+    <<A as Application<E>>::Block as Digestible>::Digest,
+>;
+type RunningState<'a, A, E> = (
+    &'a mut <A as Application<E>>::Databases,
+    &'a mut Pending<A, E>,
+    &'a mut <<A as Application<E>>::Block as Digestible>::Digest,
+);
+
+const STATE_SYNC_METADATA_SUFFIX: &str = "_state_sync_metadata";
+
+/// Startup mode for the one-time state-sync bootstrap.
+pub enum Startup<B> {
+    /// Initialize fresh databases and let marshal backfill.
+    Fresh,
+    /// Run one-time state sync from a user-supplied finalization target.
+    Sync { block: B },
+}
+
+/// Startup configuration for one-time state sync.
+pub struct StateSyncConfig<E, A, R>
+where
+    E: Rng + Spawner + Metrics + Clock,
+    A: Application<E>,
+{
+    /// Partition prefix used to derive the durable state-sync metadata partition.
+    pub partition_prefix: String,
+
+    /// Explicit startup mode.
+    pub startup: Startup<A::Block>,
+
+    /// Resolver(s) for startup sync fetches and post-bootstrap serving.
+    pub resolvers: R,
+
+    /// Sync engine tuning knobs.
+    pub sync_config: crate::stateful::db::SyncEngineConfig,
+}
 
 /// Errors while preparing parent-relative batches for propose/verify.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,8 +161,102 @@ where
     }
 }
 
+/// Startup lifecycle for one actor instance.
+enum StartupState<E, A, R>
+where
+    E: Rng + Spawner + Metrics + Clock,
+    A: Application<E>,
+{
+    /// Configuration has not been consumed by [`Stateful::start`] yet.
+    Pending {
+        db_config: <A::Databases as DatabaseSet<E>>::Config,
+        state_sync: StateSyncConfig<E, A, R>,
+        tip_updates: mpsc::Receiver<PendingSyncTip<A, E>>,
+    },
+
+    /// Startup completed and resolver attachment is available.
+    Started { sync_resolvers: R },
+
+    /// Temporary sentinel while consuming [`Pending`](Self::Pending) in `start`.
+    Consumed,
+}
+
+/// Operating mode of the [`Stateful`] actor.
+///
+/// Instances are initialized in [`Syncing`](Mode::Syncing) and transition to
+/// [`Running`](Mode::Running) when startup bootstrap calls
+/// [`Mailbox::sync_complete`].
+enum Mode<A, E>
+where
+    A: Application<E>,
+    E: Rng + Spawner + Metrics + Clock,
+{
+    /// State-sync mode: databases are not yet available.
+    ///
+    /// Proposals are rejected. Verify response channels are held without
+    /// responding so upstream verification requests time out naturally.
+    /// Finalization acknowledgements are held so marshal does not advance
+    /// past our sync target.
+    Syncing {
+        /// Verify response channels received while syncing.
+        ///
+        /// We never respond to these requests while syncing to avoid voting
+        /// against potentially-valid blocks. Closed channels are pruned as
+        /// new verify requests arrive.
+        held_verify_responses: Vec<oneshot::Sender<bool>>,
+
+        /// Finalization acknowledgements held during sync. Dropping them
+        /// without acknowledging prevents marshal from advancing past our
+        /// sync target. They are discarded on [`Message::SyncComplete`]
+        /// after `set_floor` has made them irrelevant.
+        held_acks: Vec<Exact>,
+
+        /// Channel to forward sync tips to the background sync
+        /// orchestrator. Each tip bundles the finalized block's height,
+        /// digest, and per-database sync targets.
+        tip_sender: mpsc::Sender<PendingSyncTip<A, E>>,
+    },
+
+    /// Normal consensus operation.
+    Running {
+        /// The set of databases whose batch lifecycle is managed by this wrapper.
+        databases: A::Databases,
+
+        /// Pending merkleized batches keyed by block digest, tagged with the
+        /// round in which they were produced.
+        pending: Pending<A, E>,
+
+        /// The latest observed finalized block digest.
+        ///
+        /// TODO: Rename "processed_digest" or "finalized_tip_digest" or
+        /// something less ambiguous, since this isn't the latest finalized
+        /// digest. Just the latest that we've processed locally.
+        finalized_digest: <A::Block as Digestible>::Digest,
+    },
+}
+
+impl<A, E> Mode<A, E>
+where
+    A: Application<E>,
+    E: Rng + Spawner + Metrics + Clock,
+{
+    /// Returns mutable references to `Running` state, panicking if syncing.
+    fn running(&mut self) -> RunningState<'_, A, E> {
+        match self {
+            Self::Running {
+                databases,
+                pending,
+                finalized_digest,
+            } => (databases, pending, finalized_digest),
+            Self::Syncing { .. } => {
+                panic!("stateful actor called in syncing mode")
+            }
+        }
+    }
+}
+
 /// Configuration for constructing a [`Stateful`] wrapper.
-pub struct Config<E, A, P>
+pub struct Config<E, A, P, R>
 where
     E: Rng + Spawner + Metrics + Clock,
     A: Application<E>,
@@ -132,8 +264,8 @@ where
     /// The inner application that drives state transitions.
     pub app: A,
 
-    /// The set of databases whose batch lifecycle is managed by the wrapper.
-    pub databases: A::Databases,
+    /// Configuration used to construct the database set during [`Stateful::start`].
+    pub db_config: <A::Databases as DatabaseSet<E>>::Config,
 
     /// Source of input (e.g. transactions) passed to the application on
     /// propose.
@@ -144,22 +276,27 @@ where
 
     /// Capacity of the stateful actor mailbox channel.
     pub mailbox_size: usize,
+
+    /// Startup state-sync configuration.
+    pub state_sync: StateSyncConfig<E, A, R>,
 }
 
 /// Wraps an [`Application`] and manages the pending-tip DAG of merkleized
 /// batches on its behalf, implementing the consensus
-/// [`Application`](ConsensusApplication) and
-/// [`VerifyingApplication`](ConsensusVerifyingApplication) traits.
+/// application and verifying traits.
 ///
 /// When a parent block's pending state is missing (e.g. after a restart),
 /// the wrapper lazily rebuilds it by walking back through the block DAG
 /// via the [`BlockProvider`] and replaying forward via
-/// [`Application::replay`].
-pub struct Stateful<E, A, P>
+/// [`Application::apply`].
+pub struct Stateful<E, A, P, R>
 where
     E: Rng + Spawner + Metrics + Clock,
     A: Application<E>,
 {
+    /// Sender half of the actor mailbox channel.
+    sender: mpsc::Sender<Message<E, A>>,
+
     /// Runtime context providing RNG, task spawning, metrics, and clock.
     context: ContextCell<E>,
 
@@ -169,27 +306,20 @@ where
     /// The inner application that drives state transitions.
     inner: A,
 
-    /// The set of databases whose batch lifecycle is managed by this wrapper.
-    databases: A::Databases,
-
     /// Source of input (e.g. transactions) passed to the application on propose.
     input_provider: A::InputProvider,
 
     /// Marshal mailbox used for startup anchoring and lazy recovery.
     marshal: P,
 
-    /// The latest observed finalized block digest.
-    ///
-    /// TODO: Rename "processed_digest" or "finalized_tip_digest" or something less ambiguous, since
-    /// this isn't the latest finalized digest. Just the latest that we've processed locally.
-    finalized_digest: Option<<A::Block as Digestible>::Digest>,
+    /// One-time startup lifecycle.
+    startup: StartupState<E, A, R>,
 
-    /// Pending merkleized batches keyed by block digest, tagged with the round
-    /// in which they were produced.
-    pending: Pending<A, E>,
+    /// Current operating mode (syncing or running).
+    mode: Mode<A, E>,
 }
 
-impl<E, A, P> Stateful<E, A, P>
+impl<E, A, P, R> Stateful<E, A, P, R>
 where
     E: Rng + Spawner + Metrics + Clock,
     A: Application<E>,
@@ -199,53 +329,99 @@ where
     ///
     /// This only wires dependencies and allocates the mailbox. The actor does
     /// not process messages until [`Stateful::start`] is called.
-    pub fn init(context: E, config: Config<E, A, P>) -> (Self, Mailbox<E, A>) {
+    pub fn init(context: E, config: Config<E, A, P, R>) -> (Self, Mailbox<E, A>) {
         let (sender, mailbox) = mpsc::channel(config.mailbox_size);
+        let (tip_sender, tip_updates) =
+            mpsc::channel(config.state_sync.sync_config.update_channel_size.get());
         (
             Self {
+                sender: sender.clone(),
                 context: ContextCell::new(context),
                 mailbox,
                 inner: config.app,
-                databases: config.databases,
                 input_provider: config.input_provider,
                 marshal: config.marshal,
-                finalized_digest: None,
-                pending: Pending::new(),
+                startup: StartupState::Pending {
+                    db_config: config.db_config,
+                    state_sync: config.state_sync,
+                    tip_updates,
+                },
+                mode: Mode::Syncing {
+                    held_verify_responses: Vec::new(),
+                    held_acks: Vec::new(),
+                    tip_sender,
+                },
             },
             Mailbox::new(sender),
         )
     }
 
-    /// Resolve the startup anchor from marshal and spawn the actor loop.
+    /// Start the actor and run startup bootstrap in the background.
     ///
-    /// Uses marshal's latest processed height and corresponding digest. If the
-    /// processed height is zero, uses the application's genesis digest.
-    pub async fn start<S, V>(mut self) -> Handle<()>
+    /// This is the single startup entrypoint for both modes:
+    /// - [`Startup::Fresh`]: initialize fresh databases and backfill from marshal.
+    /// - [`Startup::Sync`]: run one-time startup state sync.
+    pub fn start<S, V>(mut self) -> Handle<()>
     where
+        E: Rng + Spawner + Metrics + Clock + Storage,
+        A: Application<E>,
+        A::Context: Send,
+        A::Databases: StateSyncSet<E, R>,
         S: Scheme,
         V: marshal::core::Variant<ApplicationBlock = A::Block>,
         P: Into<marshal::core::Mailbox<S, V>>,
+        R: Clone + Send + AttachableResolverSet<A::Databases> + 'static,
     {
-        let marshal: marshal::core::Mailbox<S, V> = self.marshal.clone().into();
-        let processed_height = marshal
-            .get_processed_height()
-            .await
-            .expect("stateful actor failed to fetch processed height");
-        let finalized_digest = if processed_height == Height::zero() {
-            self.inner.genesis().await.digest()
-        } else {
-            marshal
-                .get_info(marshal::Identifier::Height(processed_height))
-                .await
-                .map(|(_, digest)| digest)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "stateful actor missing processed block digest at height {}",
-                        processed_height.get()
-                    )
-                })
+        let startup = std::mem::replace(&mut self.startup, StartupState::Consumed);
+        let StartupState::Pending {
+            db_config,
+            state_sync: config,
+            tip_updates,
+        } = startup
+        else {
+            panic!("start called more than once");
         };
-        self.finalized_digest = Some(finalized_digest);
+
+        let StateSyncConfig {
+            partition_prefix,
+            startup,
+            resolvers,
+            sync_config,
+        } = config;
+        let metadata_partition = format!("{partition_prefix}{STATE_SYNC_METADATA_SUFFIX}");
+
+        let bootstrap_startup = match startup {
+            Startup::Fresh => BootstrapStartup::Fresh,
+            Startup::Sync { block } => BootstrapStartup::Sync {
+                initial_tip: SyncTip {
+                    height: block.height(),
+                    digest: block.digest(),
+                    targets: A::sync_targets(&block),
+                },
+                tip_updates,
+                resolvers: resolvers.clone(),
+            },
+        };
+        self.startup = StartupState::Started {
+            sync_resolvers: resolvers,
+        };
+
+        let context = self.context.clone().into_present();
+        let bootstrap_config = BootstrapConfig {
+            context: context.with_label("state_sync"),
+            db_config,
+            metadata_partition,
+            sync_config,
+            startup: bootstrap_startup,
+        };
+        let marshal: marshal::core::Mailbox<S, V> = self.marshal.clone().into();
+        let mailbox = Mailbox::new(self.sender.clone());
+        context
+            .with_label("state_sync_bootstrap")
+            .spawn(move |_| async move {
+                bootstrap(marshal, mailbox, bootstrap_config).await;
+            });
+
         spawn_cell!(self.context, self.run().await)
     }
 
@@ -254,7 +430,10 @@ where
     /// Processes mailbox messages serially until either:
     /// - the runtime context is stopped, or
     /// - all mailbox senders are dropped.
-    async fn run(mut self) {
+    async fn run(mut self)
+    where
+        R: AttachableResolverSet<A::Databases>,
+    {
         select_loop! {
             self.context,
             on_stopped => {
@@ -274,6 +453,12 @@ where
                     },
                     Message::Finalized { block, acknowledgement } => {
                         self.handle_finalized(block, acknowledgement).await;
+                    },
+                    Message::Tip { height, digest } => {
+                        self.handle_tip(height, digest).await;
+                    },
+                    Message::SyncComplete { databases, finalized_digest } => {
+                        self.handle_sync_complete(databases, finalized_digest).await;
                     }
                 }
             }
@@ -293,7 +478,11 @@ where
         ancestry: ErasedAncestorStream<A::Block>,
         mut response: oneshot::Sender<Option<A::Block>>,
     ) {
-        // TODO: Return `None` immediately if we are currently state syncing.
+        if matches!(self.mode, Mode::Syncing { .. }) {
+            debug!("proposal rejected: state sync in progress");
+            response.send_lossy(None);
+            return;
+        }
 
         // The ancestry stream starts from the parent block.
         let Some(parent) = ancestry.peek() else {
@@ -344,7 +533,8 @@ where
             response.send_lossy(None);
             return;
         };
-        self.pending.insert(block.digest(), round, merkleized);
+        let (_, pending, _) = self.mode.running();
+        pending.insert(block.digest(), round, merkleized);
 
         // Send the built block back to the application.
         response.send_lossy(Some(block));
@@ -357,8 +547,19 @@ where
         ancestry: ErasedAncestorStream<A::Block>,
         mut response: oneshot::Sender<bool>,
     ) {
-        // TODO: Wait until state sync has completed, or the response is dropped,
-        // if state sync is active.
+        if let Mode::Syncing {
+            held_verify_responses,
+            ..
+        } = &mut self.mode
+        {
+            held_verify_responses.retain(|response| !response.is_closed());
+            held_verify_responses.push(response);
+            debug!(
+                held_verify_responses = held_verify_responses.len(),
+                "verify held: state sync in progress"
+            );
+            return;
+        }
 
         let Some(block) = ancestry.peek() else {
             response.send_lossy(false);
@@ -408,7 +609,8 @@ where
             response.send_lossy(false);
             return;
         };
-        self.pending.insert(block_digest, round, merkleized);
+        let (_, pending, _) = self.mode.running();
+        pending.insert(block_digest, round, merkleized);
 
         // Inform the application that the block is valid.
         response.send_lossy(true);
@@ -416,22 +618,31 @@ where
 
     /// Handles a [`Message::Finalized`].
     async fn handle_finalized(&mut self, block: A::Block, acknowledgement: Exact) {
-        // TODO: Forward sync target.
+        if let Mode::Syncing { held_acks, .. } = &mut self.mode {
+            debug!(
+                height = block.height().get(),
+                "finalization held during sync (not yet acknowledged)"
+            );
+            held_acks.push(acknowledgement);
+            return;
+        }
+
+        let (databases, pending, finalized_digest) = self.mode.running();
 
         // Duplicate finalization reports are benign. A node may
         // observe the same finalization certificate multiple times
         // from replay or the network.
-        if self.finalized_digest == Some(block.digest()) {
+        if *finalized_digest == block.digest() {
             acknowledgement.acknowledge();
             return;
         }
 
         // Try to use existing pending state from propose/verify, otherwise
         // apply the block on top of the finalized state database.
-        let batch = match self.pending.remove(&block.digest()) {
+        let batch = match pending.remove(&block.digest()) {
             Some((_, merkleized)) => merkleized,
             None => {
-                let batches = self.databases.new_batches().await;
+                let batches = databases.new_batches().await;
                 let replay_context = self.context.clone().into_present();
                 self.inner
                     .apply((replay_context, block.context()), &block, batches)
@@ -443,14 +654,104 @@ where
         // chains, and acknowledge that the application has processed the finalized
         // block.
         let round = Round::new(block.context().epoch(), block.context().view());
-        self.databases.finalize(batch).await;
-        self.pending.retain_newer_than(round);
-        self.finalized_digest = Some(block.digest());
+        databases.finalize(batch).await;
+        pending.retain_newer_than(round);
+        *finalized_digest = block.digest();
         acknowledgement.acknowledge();
 
         info!(
             height = block.height().get(),
             "persisted finalized database batch"
+        );
+    }
+
+    /// Handles a [`Message::Tip`].
+    ///
+    /// In [`Mode::Syncing`], fetches the block from marshal, extracts
+    /// per-database sync targets via [`Application::sync_targets`], and
+    /// forwards them to the background sync engines.
+    ///
+    /// In [`Mode::Running`], this is a no-op.
+    async fn handle_tip(&mut self, height: Height, digest: <A::Block as Digestible>::Digest) {
+        let Mode::Syncing { tip_sender, .. } = &self.mode else {
+            return;
+        };
+
+        let Some(block) = self.marshal.clone().fetch_block(digest).await else {
+            debug!(
+                height = height.get(),
+                "tip block not available from provider, skipping target update"
+            );
+            return;
+        };
+
+        let targets = A::sync_targets(&block);
+        if tip_sender
+            .try_send(SyncTip {
+                height,
+                digest,
+                targets,
+            })
+            .is_err()
+        {
+            debug!(
+                height = height.get(),
+                "tip update channel unavailable, keeping existing sync target"
+            );
+        }
+    }
+
+    /// Handles a [`Message::SyncComplete`].
+    ///
+    /// Transitions from [`Mode::Syncing`] to [`Mode::Running`].
+    ///
+    /// Any held verify response channels are dropped without sending a
+    /// response so their callers can time out naturally.
+    async fn handle_sync_complete(
+        &mut self,
+        databases: A::Databases,
+        finalized_digest: <A::Block as Digestible>::Digest,
+    ) where
+        R: AttachableResolverSet<A::Databases>,
+    {
+        let (held_verify_responses, held_acks) = match &mut self.mode {
+            Mode::Syncing {
+                held_verify_responses,
+                held_acks,
+                ..
+            } => (
+                std::mem::take(held_verify_responses),
+                std::mem::take(held_acks),
+            ),
+            Mode::Running { .. } => {
+                panic!("SyncComplete received while already in Running mode");
+            }
+        };
+        let sync_resolvers = match &self.startup {
+            StartupState::Started { sync_resolvers } => sync_resolvers,
+            StartupState::Pending { .. } | StartupState::Consumed => {
+                panic!("SyncComplete received before startup reached Started state");
+            }
+        };
+        sync_resolvers.attach_databases(databases.clone()).await;
+
+        self.mode = Mode::Running {
+            databases,
+            pending: Pending::new(),
+            finalized_digest,
+        };
+
+        let held_verifies = held_verify_responses.len();
+        let dropped_open_verifies = held_verify_responses
+            .iter()
+            .filter(|response| !response.is_closed())
+            .count();
+        let dropped_acks = held_acks.len();
+        drop(held_verify_responses);
+        drop(held_acks);
+        info!(
+            held_verifies,
+            dropped_open_verifies, dropped_acks, "sync complete, transitioning to running mode"
         );
     }
 
@@ -463,24 +764,20 @@ where
     /// - `Ok(batches)` when parent state is available and batches are ready.
     /// - `Err(PrepareBatchesError::Invalid)` when rebuild cannot safely anchor.
     /// - `Err(PrepareBatchesError::Cancelled)` when caller drops the response while waiting.
-    async fn prepare_batches<R>(
+    async fn prepare_batches<Response>(
         &mut self,
         parent: <A::Block as Digestible>::Digest,
-        response: &mut oneshot::Sender<R>,
-    ) -> Result<<A::Databases as DatabaseSet>::Unmerkleized, PrepareBatchesError> {
-        let finalized_digest = self
-            .finalized_digest
-            .as_ref()
-            .expect("stateful actor started without finalized digest");
-        let needs_rebuild = finalized_digest != &parent && !self.pending.contains(&parent);
+        response: &mut oneshot::Sender<Response>,
+    ) -> Result<<A::Databases as DatabaseSet<E>>::Unmerkleized, PrepareBatchesError> {
+        let (_, pending, finalized_digest) = self.mode.running();
+        let needs_rebuild = finalized_digest != &parent && !pending.contains(&parent);
         if needs_rebuild {
             self.rebuild_pending(parent, response).await?;
         }
 
-        match await_or_cancel(response, self.fork_batches(&parent)).await {
-            Some(res) => res,
-            None => Err(PrepareBatchesError::Cancelled),
-        }
+        await_or_cancel(response, self.fork_batches(&parent))
+            .await
+            .unwrap_or_else(|| Err(PrepareBatchesError::Cancelled))
     }
 
     /// Fork unmerkleized batches from parent state.
@@ -491,16 +788,13 @@ where
     async fn fork_batches(
         &mut self,
         parent: &<A::Block as Digestible>::Digest,
-    ) -> Result<<A::Databases as DatabaseSet>::Unmerkleized, PrepareBatchesError> {
-        if let Some(merkleized) = self.pending.get_merkleized(parent) {
-            return Ok(<A::Databases as DatabaseSet>::fork_batches(merkleized));
+    ) -> Result<<A::Databases as DatabaseSet<E>>::Unmerkleized, PrepareBatchesError> {
+        let (databases, pending, finalized_digest) = self.mode.running();
+        if let Some(merkleized) = pending.get_merkleized(parent) {
+            return Ok(<A::Databases as DatabaseSet<E>>::fork_batches(merkleized));
         }
-        let is_finalized_parent = self
-            .finalized_digest
-            .as_ref()
-            .is_some_and(|finalized_digest| finalized_digest == parent);
-        if is_finalized_parent {
-            return Ok(self.databases.new_batches().await);
+        if finalized_digest == parent {
+            return Ok(databases.new_batches().await);
         }
         Err(PrepareBatchesError::Invalid)
     }
@@ -516,23 +810,21 @@ where
     /// - `Ok(())` if replay succeeds.
     /// - `Err(PrepareBatchesError::Invalid)` if we cannot anchor the walk.
     /// - `Err(PrepareBatchesError::Cancelled)` if caller drops the response.
-    async fn rebuild_pending<R>(
+    async fn rebuild_pending<Response>(
         &mut self,
         target: <A::Block as Digestible>::Digest,
-        response: &mut oneshot::Sender<R>,
+        response: &mut oneshot::Sender<Response>,
     ) -> Result<(), PrepareBatchesError> {
-        let finalized_digest = self
-            .finalized_digest
-            .as_ref()
-            .expect("stateful actor started without finalized digest");
+        let (_, pending, finalized_digest) = self.mode.running();
+        let finalized_digest = *finalized_digest;
 
         // Walk back, collecting blocks whose pending state is missing.
         let mut to_replay = Vec::new();
         let mut current = target;
-        while current != *finalized_digest {
+        while current != finalized_digest {
             // If we already have pending state for this digest, we have a safe
             // replay anchor and should not depend on provider availability.
-            if self.pending.contains(&current) {
+            if pending.contains(&current) {
                 break;
             }
 
@@ -594,7 +886,8 @@ where
                 None => return Err(PrepareBatchesError::Cancelled),
             };
 
-            self.pending.insert(digest, round, merkleized);
+            let (_, pending, _) = self.mode.running();
+            pending.insert(digest, round, merkleized);
         }
         Ok(())
     }
@@ -602,9 +895,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PrepareBatchesError, Stateful};
+    use super::{
+        Mode, Pending, PendingSyncTip, PrepareBatchesError, Startup, StartupState, StateSyncConfig,
+        Stateful,
+    };
     use crate::stateful::{
-        db::{DatabaseSet, Merkleized, Unmerkleized},
+        db::{qmdb::resolver::AttachableResolverSet, DatabaseSet, Merkleized, Unmerkleized},
         Application, Config as StatefulConfig,
     };
     use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
@@ -618,10 +914,15 @@ mod tests {
         ed25519, sha256::Digest, Digest as _, Digestible, Hasher, Sha256, Signer as _,
     };
     use commonware_runtime::{deterministic, Clock, Metrics, Runner as _, Spawner};
-    use commonware_utils::channel::oneshot;
+    use commonware_storage::{mmr::Location, qmdb::sync::Target};
+    use commonware_utils::{
+        channel::{mpsc, oneshot},
+        NZUsize,
+    };
     use std::{
         collections::BTreeMap,
         convert::Infallible,
+        num::NonZeroU64,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
@@ -746,9 +1047,15 @@ mod tests {
     #[derive(Clone, Copy)]
     struct TestDatabases;
 
-    impl DatabaseSet for TestDatabases {
+    impl<E: Send> DatabaseSet<E> for TestDatabases {
         type Unmerkleized = TestUnmerkleized;
         type Merkleized = TestMerkleized;
+        type Config = ();
+        type SyncTargets = Vec<Target<Digest>>;
+
+        async fn init(_context: E, _config: Self::Config) -> Self {
+            Self
+        }
 
         async fn new_batches(&self) -> Self::Unmerkleized {
             TestUnmerkleized
@@ -779,9 +1086,12 @@ mod tests {
             &mut self,
             _context: (deterministic::Context, Self::Context),
             _ancestry: AncestorStream<A, Self::Block>,
-            _batches: <Self::Databases as DatabaseSet>::Unmerkleized,
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
             _input: &mut Self::InputProvider,
-        ) -> Option<(Self::Block, <Self::Databases as DatabaseSet>::Merkleized)> {
+        ) -> Option<(
+            Self::Block,
+            <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized,
+        )> {
             None
         }
 
@@ -789,8 +1099,8 @@ mod tests {
             &mut self,
             _context: (deterministic::Context, Self::Context),
             _ancestry: AncestorStream<A, Self::Block>,
-            _batches: <Self::Databases as DatabaseSet>::Unmerkleized,
-        ) -> Option<<Self::Databases as DatabaseSet>::Merkleized> {
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
+        ) -> Option<<Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized> {
             Some(TestMerkleized)
         }
 
@@ -798,9 +1108,15 @@ mod tests {
             &mut self,
             _context: (deterministic::Context, Self::Context),
             _block: &Self::Block,
-            _batches: <Self::Databases as DatabaseSet>::Unmerkleized,
-        ) -> <Self::Databases as DatabaseSet>::Merkleized {
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
+        ) -> <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized {
             TestMerkleized
+        }
+
+        fn sync_targets(
+            _block: &Self::Block,
+        ) -> <Self::Databases as DatabaseSet<deterministic::Context>>::SyncTargets {
+            Vec::new()
         }
     }
 
@@ -824,9 +1140,12 @@ mod tests {
             &mut self,
             _context: (deterministic::Context, Self::Context),
             _ancestry: AncestorStream<A, Self::Block>,
-            _batches: <Self::Databases as DatabaseSet>::Unmerkleized,
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
             _input: &mut Self::InputProvider,
-        ) -> Option<(Self::Block, <Self::Databases as DatabaseSet>::Merkleized)> {
+        ) -> Option<(
+            Self::Block,
+            <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized,
+        )> {
             None
         }
 
@@ -834,8 +1153,8 @@ mod tests {
             &mut self,
             _context: (deterministic::Context, Self::Context),
             _ancestry: AncestorStream<A, Self::Block>,
-            _batches: <Self::Databases as DatabaseSet>::Unmerkleized,
-        ) -> Option<<Self::Databases as DatabaseSet>::Merkleized> {
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
+        ) -> Option<<Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized> {
             Some(TestMerkleized)
         }
 
@@ -843,11 +1162,17 @@ mod tests {
             &mut self,
             (runtime_context, _): (deterministic::Context, Self::Context),
             _block: &Self::Block,
-            _batches: <Self::Databases as DatabaseSet>::Unmerkleized,
-        ) -> <Self::Databases as DatabaseSet>::Merkleized {
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
+        ) -> <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized {
             self.started.store(true, Ordering::SeqCst);
             runtime_context.sleep(Duration::from_secs(1)).await;
             TestMerkleized
+        }
+
+        fn sync_targets(
+            _block: &Self::Block,
+        ) -> <Self::Databases as DatabaseSet<deterministic::Context>>::SyncTargets {
+            Vec::new()
         }
     }
 
@@ -939,6 +1264,50 @@ mod tests {
         }
     }
 
+    fn test_state_sync_config<A>() -> StateSyncConfig<deterministic::Context, A, ()>
+    where
+        A: Application<deterministic::Context>,
+    {
+        StateSyncConfig {
+            partition_prefix: "test".to_string(),
+            startup: Startup::Fresh,
+            resolvers: (),
+            sync_config: crate::stateful::db::SyncEngineConfig {
+                fetch_batch_size: NonZeroU64::new(1).expect("fetch batch size must be non-zero"),
+                apply_batch_size: 1,
+                max_outstanding_requests: 1,
+                update_channel_size: NZUsize!(1),
+            },
+        }
+    }
+
+    #[derive(Clone)]
+    struct LifecycleResolver {
+        attached: Arc<AtomicBool>,
+    }
+
+    impl LifecycleResolver {
+        fn new() -> Self {
+            Self {
+                attached: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn get_operations(&self) -> Result<(), &'static str> {
+            if self.attached.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("resolver not attached")
+            }
+        }
+    }
+
+    impl AttachableResolverSet<TestDatabases> for LifecycleResolver {
+        async fn attach_databases(&self, _databases: TestDatabases) {
+            self.attached.store(true, Ordering::SeqCst);
+        }
+    }
+
     #[test]
     fn rebuild_pending_never_requests_genesis_from_provider() {
         deterministic::Runner::default().start(|context| async move {
@@ -958,14 +1327,19 @@ mod tests {
                 context.clone(),
                 StatefulConfig {
                     app: TestApp,
-                    databases: TestDatabases,
+                    db_config: (),
                     input_provider: (),
                     marshal: provider,
                     mailbox_size: 16,
+                    state_sync: test_state_sync_config::<TestApp>(),
                 },
             );
 
-            actor.finalized_digest = Some(Sha256::hash(b"other-finalized-tip"));
+            actor.mode = Mode::Running {
+                databases: TestDatabases,
+                pending: Pending::new(),
+                finalized_digest: Sha256::hash(b"other-finalized-tip"),
+            };
             let (mut response, _rx) = oneshot::channel::<bool>();
             let rebuilt = actor.rebuild_pending(block2.digest(), &mut response).await;
             assert_eq!(
@@ -998,14 +1372,19 @@ mod tests {
                 context.clone(),
                 StatefulConfig {
                     app: TestApp,
-                    databases: TestDatabases,
+                    db_config: (),
                     input_provider: (),
                     marshal: provider,
                     mailbox_size: 16,
+                    state_sync: test_state_sync_config::<TestApp>(),
                 },
             );
 
-            actor.finalized_digest = Some(block1.digest());
+            actor.mode = Mode::Running {
+                databases: TestDatabases,
+                pending: Pending::new(),
+                finalized_digest: block1.digest(),
+            };
             let (mut response, _rx) = oneshot::channel::<bool>();
             let rebuilt = actor.rebuild_pending(block2.digest(), &mut response).await;
             assert_eq!(
@@ -1031,13 +1410,18 @@ mod tests {
                 context.clone(),
                 StatefulConfig {
                     app: TestApp,
-                    databases: TestDatabases,
+                    db_config: (),
                     input_provider: (),
                     marshal: AlwaysMissingProvider,
                     mailbox_size: 16,
+                    state_sync: test_state_sync_config::<TestApp>(),
                 },
             );
-            actor.finalized_digest = Some(block1.digest());
+            actor.mode = Mode::Running {
+                databases: TestDatabases,
+                pending: Pending::new(),
+                finalized_digest: block1.digest(),
+            };
 
             let (mut response, rx) = oneshot::channel::<bool>();
             drop(rx);
@@ -1072,13 +1456,18 @@ mod tests {
                     app: SlowReplayApp {
                         started: started.clone(),
                     },
-                    databases: TestDatabases,
+                    db_config: (),
                     input_provider: (),
                     marshal: provider,
                     mailbox_size: 16,
+                    state_sync: test_state_sync_config::<SlowReplayApp>(),
                 },
             );
-            actor.finalized_digest = Some(block1.digest());
+            actor.mode = Mode::Running {
+                databases: TestDatabases,
+                pending: Pending::new(),
+                finalized_digest: block1.digest(),
+            };
 
             let (mut response, rx) = oneshot::channel::<bool>();
             let rebuild = context
@@ -1101,6 +1490,210 @@ mod tests {
         });
     }
 
+    #[derive(Clone)]
+    struct SyncTargetApp;
+
+    impl Application<deterministic::Context> for SyncTargetApp {
+        type SigningScheme = MockScheme<ed25519::PublicKey>;
+        type Context = TestContext;
+        type Block = TestBlock;
+        type Databases = TestDatabases;
+        type InputProvider = ();
+
+        async fn genesis(&mut self) -> Self::Block {
+            make_block(Height::zero(), Digest::EMPTY, View::zero())
+        }
+
+        async fn propose<A: BlockProvider<Block = Self::Block>>(
+            &mut self,
+            _context: (deterministic::Context, Self::Context),
+            _ancestry: AncestorStream<A, Self::Block>,
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
+            _input: &mut Self::InputProvider,
+        ) -> Option<(
+            Self::Block,
+            <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized,
+        )> {
+            None
+        }
+
+        async fn verify<A: BlockProvider<Block = Self::Block>>(
+            &mut self,
+            _context: (deterministic::Context, Self::Context),
+            _ancestry: AncestorStream<A, Self::Block>,
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
+        ) -> Option<<Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized> {
+            Some(TestMerkleized)
+        }
+
+        async fn apply(
+            &mut self,
+            _context: (deterministic::Context, Self::Context),
+            _block: &Self::Block,
+            _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
+        ) -> <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized {
+            TestMerkleized
+        }
+
+        fn sync_targets(
+            block: &Self::Block,
+        ) -> <Self::Databases as DatabaseSet<deterministic::Context>>::SyncTargets {
+            vec![Target {
+                root: block.digest(),
+                range: Location::new(0)..Location::new(100),
+            }]
+        }
+    }
+
+    #[test]
+    fn tip_in_syncing_mode_forwards_targets() {
+        deterministic::Runner::default().start(|context| async move {
+            let genesis_digest = Sha256::hash(b"genesis");
+            let block1 = make_block(Height::new(1), genesis_digest, View::new(1));
+
+            let provider = PanicOnGenesisProvider {
+                blocks: Arc::new(BTreeMap::from([(block1.digest(), block1.clone())])),
+                genesis_digest,
+            };
+
+            let (target_tx, mut target_rx) =
+                mpsc::channel::<PendingSyncTip<SyncTargetApp, deterministic::Context>>(1);
+
+            let (mut actor, _mailbox) = Stateful::init(
+                context.clone(),
+                StatefulConfig {
+                    app: SyncTargetApp,
+                    db_config: (),
+                    input_provider: (),
+                    marshal: provider,
+                    mailbox_size: 16,
+                    state_sync: test_state_sync_config::<SyncTargetApp>(),
+                },
+            );
+            if let Mode::Syncing { tip_sender, .. } = &mut actor.mode {
+                *tip_sender = target_tx;
+            }
+
+            actor.handle_tip(block1.height(), block1.digest()).await;
+
+            let received = target_rx.try_recv().expect("tip should be forwarded");
+            assert_eq!(received.height, block1.height());
+            assert_eq!(received.digest, block1.digest());
+            assert_eq!(received.targets.len(), 1);
+            assert_eq!(received.targets[0].root, block1.digest());
+            assert_eq!(
+                received.targets[0].range,
+                Location::new(0)..Location::new(100),
+            );
+        });
+    }
+
+    #[test]
+    fn tip_in_running_mode_is_noop() {
+        deterministic::Runner::default().start(|context| async move {
+            let genesis_digest = Sha256::hash(b"genesis");
+            let block1 = make_block(Height::new(1), genesis_digest, View::new(1));
+
+            let (_target_tx, mut target_rx) =
+                mpsc::channel::<PendingSyncTip<SyncTargetApp, deterministic::Context>>(1);
+
+            let (mut actor, _mailbox) = Stateful::init(
+                context.clone(),
+                StatefulConfig {
+                    app: SyncTargetApp,
+                    db_config: (),
+                    input_provider: (),
+                    marshal: PanicOnFetchProvider,
+                    mailbox_size: 16,
+                    state_sync: test_state_sync_config::<SyncTargetApp>(),
+                },
+            );
+
+            actor.mode = Mode::Running {
+                databases: TestDatabases,
+                pending: Pending::new(),
+                finalized_digest: genesis_digest,
+            };
+
+            actor.handle_tip(block1.height(), block1.digest()).await;
+
+            assert!(
+                target_rx.try_recv().is_err(),
+                "no target should be sent in running mode"
+            );
+        });
+    }
+
+    #[test]
+    fn resolver_denies_pre_sync_complete() {
+        deterministic::Runner::default().start(|context| async move {
+            let resolver = LifecycleResolver::new();
+            let (_actor, _mailbox) = Stateful::init(
+                context.clone(),
+                StatefulConfig {
+                    app: TestApp,
+                    db_config: (),
+                    input_provider: (),
+                    marshal: AlwaysMissingProvider,
+                    mailbox_size: 16,
+                    state_sync: StateSyncConfig::<_, _, LifecycleResolver> {
+                        partition_prefix: "test".to_string(),
+                        startup: Startup::Fresh,
+                        resolvers: resolver.clone(),
+                        sync_config: crate::stateful::db::SyncEngineConfig {
+                            fetch_batch_size: NonZeroU64::new(1).unwrap(),
+                            apply_batch_size: 1,
+                            max_outstanding_requests: 1,
+                            update_channel_size: NZUsize!(1),
+                        },
+                    },
+                },
+            );
+
+            assert_eq!(resolver.get_operations(), Err("resolver not attached"));
+        });
+    }
+
+    #[test]
+    fn resolver_serves_post_sync_complete() {
+        deterministic::Runner::default().start(|context| async move {
+            let resolver = LifecycleResolver::new();
+            let (mut actor, _mailbox) = Stateful::init(
+                context.clone(),
+                StatefulConfig {
+                    app: TestApp,
+                    db_config: (),
+                    input_provider: (),
+                    marshal: AlwaysMissingProvider,
+                    mailbox_size: 16,
+                    state_sync: StateSyncConfig::<_, _, LifecycleResolver> {
+                        partition_prefix: "test".to_string(),
+                        startup: Startup::Fresh,
+                        resolvers: resolver.clone(),
+                        sync_config: crate::stateful::db::SyncEngineConfig {
+                            fetch_batch_size: NonZeroU64::new(1).unwrap(),
+                            apply_batch_size: 1,
+                            max_outstanding_requests: 1,
+                            update_channel_size: NZUsize!(1),
+                        },
+                    },
+                },
+            );
+            actor.startup = StartupState::Started {
+                sync_resolvers: resolver.clone(),
+            };
+
+            actor
+                .handle_sync_complete(
+                    TestDatabases,
+                    make_block(Height::zero(), Digest::EMPTY, View::zero()).digest(),
+                )
+                .await;
+
+            assert_eq!(resolver.get_operations(), Ok(()));
+        });
+    }
+
     #[test]
     fn rebuild_pending_prefers_local_pending_anchor_before_fetch() {
         deterministic::Runner::default().start(|context| async move {
@@ -1112,18 +1705,24 @@ mod tests {
                 context.clone(),
                 StatefulConfig {
                     app: TestApp,
-                    databases: TestDatabases,
+                    db_config: (),
                     input_provider: (),
                     marshal: PanicOnFetchProvider,
                     mailbox_size: 16,
+                    state_sync: test_state_sync_config::<TestApp>(),
                 },
             );
-            actor.finalized_digest = Some(block1.digest());
-            actor.pending.insert(
+            let mut pending = Pending::new();
+            pending.insert(
                 block2.digest(),
                 Round::new(Epoch::zero(), View::new(2)),
                 TestMerkleized,
             );
+            actor.mode = Mode::Running {
+                databases: TestDatabases,
+                pending,
+                finalized_digest: block1.digest(),
+            };
 
             let (mut response, _rx) = oneshot::channel::<bool>();
             let rebuilt = actor.rebuild_pending(block2.digest(), &mut response).await;

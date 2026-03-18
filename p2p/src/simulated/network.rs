@@ -602,7 +602,7 @@ enum LinkKey<P: PublicKey> {
 }
 
 impl<P: PublicKey> LinkKey<P> {
-    fn new(sender: P, receiver: P, selector: LinkSelector) -> Self {
+    const fn new(sender: P, receiver: P, selector: LinkSelector) -> Self {
         match selector {
             LinkSelector::All => Self::All(sender, receiver),
             LinkSelector::Channel(channel) => Self::Channel(sender, receiver, channel),
@@ -713,7 +713,7 @@ impl<E: RNetwork + Spawner + Rng + Clock + Metrics, P: PublicKey> Network<E, P> 
             // Determine if there is a link between the origin and recipient
             let Some((sampler, success_rate)) = self
                 .link_for_channel(&origin, &recipient, channel)
-                .map(|link| (link.sampler.clone(), link.success_rate))
+                .map(|link| (link.sampler, link.success_rate))
             else {
                 trace!(?origin, ?recipient, reason = "no link", "dropping message");
                 continue;

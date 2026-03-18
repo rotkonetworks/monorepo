@@ -6,9 +6,11 @@ use commonware_consensus::{
         ancestry::{AncestorStream, BlockProvider, ErasedBlockProvider},
         Update,
     },
+    types::Height,
     Application as ConsensusApplication, Reporter,
     VerifyingApplication as ConsensusVerifyingApplication,
 };
+use commonware_cryptography::Digestible;
 use commonware_runtime::{Clock, Metrics, Spawner};
 use commonware_utils::{
     acknowledgement::Exact,
@@ -47,13 +49,28 @@ where
         block: A::Block,
         acknowledgement: Exact,
     },
+
+    /// A new finalized tip observed by marshal.
+    ///
+    /// During state sync, the actor uses this to fetch the block and
+    /// extract updated sync targets. In running mode, this is a no-op.
+    Tip {
+        height: Height,
+        digest: <A::Block as Digestible>::Digest,
+    },
+
+    /// Signals that state sync is complete and the actor should transition
+    /// to `Mode::Running`.
+    SyncComplete {
+        databases: A::Databases,
+        finalized_digest: <A::Block as Digestible>::Digest,
+    },
 }
 
 /// Channel-based proxy to the [`Stateful`](super::Stateful) actor.
 ///
-/// Implements the consensus [`Application`] and [`VerifyingApplication`]
-/// traits by forwarding each call to the actor via a message and awaiting
-/// the response.
+/// Implements the consensus application and verifying traits by forwarding
+/// each call to the actor via a message and awaiting the response.
 pub struct Mailbox<E, A>
 where
     E: Rng + Spawner + Metrics + Clock,
@@ -80,8 +97,31 @@ where
     A: Application<E>,
 {
     /// Create a mailbox from the send half of the actor's message channel.
-    pub(crate) fn new(sender: mpsc::Sender<Message<E, A>>) -> Self {
+    pub(crate) const fn new(sender: mpsc::Sender<Message<E, A>>) -> Self {
         Self { sender }
+    }
+}
+
+impl<E, A> Mailbox<E, A>
+where
+    E: Rng + Spawner + Metrics + Clock,
+    A: Application<E>,
+    A::Context: Send,
+{
+    /// Signal that state sync is complete, providing the constructed databases
+    /// and the finalized digest to transition the actor to running mode.
+    pub async fn sync_complete(
+        &self,
+        databases: A::Databases,
+        finalized_digest: <A::Block as Digestible>::Digest,
+    ) {
+        self.sender
+            .send(Message::SyncComplete {
+                databases,
+                finalized_digest,
+            })
+            .await
+            .expect("stateful actor dropped during sync_complete");
     }
 }
 
@@ -154,7 +194,11 @@ where
 
     async fn report(&mut self, activity: Self::Activity) {
         match activity {
-            Update::Tip(_, _, _) => {}
+            Update::Tip(_, height, digest) => {
+                self.sender
+                    .send_lossy(Message::Tip { height, digest })
+                    .await;
+            }
             Update::Block(block, acknowledgement) => {
                 self.sender
                     .send_lossy(Message::Finalized {

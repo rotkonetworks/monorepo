@@ -2,6 +2,7 @@
 
 use crate::{types::Height, Block, Heightable};
 use commonware_cryptography::Digestible;
+use commonware_utils::sync::Mutex;
 use futures::{
     future::{BoxFuture, OptionFuture},
     FutureExt, Stream,
@@ -53,10 +54,10 @@ impl<B: Block> ErasedBlockProvider<B> {
     /// is `Sync` (required by `Arc<dyn Fn + Send + Sync>`). The lock is
     /// held only for the duration of `clone()`, never across an await.
     pub fn new<M: BlockProvider<Block = B>>(provider: M) -> Self {
-        let provider = Arc::new(std::sync::Mutex::new(provider));
+        let provider = Arc::new(Mutex::new(provider));
         Self {
             fetch: Arc::new(move |digest| {
-                let p = provider.lock().expect("poisoned").clone();
+                let p = provider.lock().clone();
                 Box::pin(async move { p.fetch_block(digest).await })
             }),
         }

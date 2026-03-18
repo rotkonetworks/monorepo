@@ -5,8 +5,11 @@ use crate::{
         reporter::MonitorReporter,
     },
     stateful::{
-        db::{DatabaseSet, Merkleized as _, Unmerkleized as _},
-        Application, Config as StatefulConfig, Stateful as StatefulActor,
+        db::{
+            qmdb::resolver as qmdb_resolver, DatabaseSet, Merkleized as _, SyncEngineConfig,
+            Unmerkleized as _,
+        },
+        Application, Config as StatefulConfig, Startup, StateSyncConfig, Stateful as StatefulActor,
     },
 };
 use commonware_broadcast::buffered;
@@ -18,6 +21,7 @@ use commonware_consensus::{
         core::Actor as MarshalActor,
         resolver::p2p as marshal_resolver,
         standard::{Deferred, Standard},
+        Identifier as MarshalIdentifier,
     },
     simplex::{
         self,
@@ -35,15 +39,24 @@ use commonware_cryptography::{
 };
 use commonware_parallel::Sequential;
 use commonware_runtime::{
-    buffer::paged::CacheRef, deterministic, Buf, BufMut, Clock, Handle, Metrics, Quota, Spawner,
+    buffer::paged::CacheRef, Buf, BufMut, Clock, Handle, Metrics, Quota, Spawner, Storage,
 };
 use commonware_storage::{
     archive::immutable,
-    qmdb::any::{unordered::fixed, FixedConfig},
+    mmr::Location,
+    qmdb::{
+        any::{unordered::fixed, FixedConfig},
+        sync::Target,
+    },
     translator::TwoCap,
 };
-use commonware_utils::{sync::AsyncRwLock, test_rng, NZUsize, NZU16, NZU64};
+use commonware_utils::{
+    sync::{AsyncRwLock, Mutex},
+    test_rng, NZUsize, NZU16, NZU64,
+};
+use rand::Rng;
 use std::{
+    collections::{BTreeMap, HashMap},
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     sync::Arc,
     time::Duration,
@@ -53,18 +66,19 @@ const EPOCH_LENGTH: NonZeroU64 = NZU64!(u64::MAX);
 const NAMESPACE: &[u8] = b"stateful_e2e_test";
 const PAGE_SIZE: NonZeroU16 = NZU16!(1024);
 const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(10);
+const IO_BUFFER_SIZE: NonZeroUsize = NZUsize!(2048);
 const TEST_QUOTA: Quota = Quota::per_second(NonZeroU32::MAX);
 
 /// The QMDB database type used by the e2e tests.
-type Qmdb = fixed::Db<deterministic::Context, sha256::Digest, sha256::Digest, Sha256, TwoCap>;
+type Qmdb<E> = fixed::Db<E, sha256::Digest, sha256::Digest, Sha256, TwoCap>;
 
-pub(crate) type MockDatabaseSet = Arc<AsyncRwLock<Qmdb>>;
+pub(crate) type MockDatabaseSet<E> = Arc<AsyncRwLock<Qmdb<E>>>;
 type MarshalMailbox = marshal::core::Mailbox<MockScheme<ed25519::PublicKey>, Standard<Block>>;
 
 #[derive(Clone)]
 pub(crate) struct MockValidatorState {
-    _db: MockDatabaseSet,
     marshal: MarshalMailbox,
+    startup_sync_height: Option<u64>,
 }
 
 impl MockValidatorState {
@@ -73,6 +87,10 @@ impl MockValidatorState {
             .get_info(marshal::Identifier::Height(Height::new(height)))
             .await
             .map(|(_, digest)| digest)
+    }
+
+    pub(crate) const fn startup_sync_height(&self) -> Option<u64> {
+        self.startup_sync_height
     }
 }
 
@@ -116,6 +134,8 @@ pub(crate) struct Block {
     height: Height,
     digest: sha256::Digest,
     state_root: sha256::Digest,
+    inactivity_floor: Location,
+    op_count: Location,
 }
 
 impl Write for Block {
@@ -125,6 +145,8 @@ impl Write for Block {
         self.height.write(buf);
         self.digest.write(buf);
         self.state_root.write(buf);
+        self.inactivity_floor.write(buf);
+        self.op_count.write(buf);
     }
 }
 
@@ -135,6 +157,8 @@ impl EncodeSize for Block {
             + self.height.encode_size()
             + self.digest.encode_size()
             + self.state_root.encode_size()
+            + self.inactivity_floor.encode_size()
+            + self.op_count.encode_size()
     }
 }
 
@@ -147,12 +171,16 @@ impl Read for Block {
         let height = Height::read(buf)?;
         let digest = sha256::Digest::read(buf)?;
         let state_root = sha256::Digest::read(buf)?;
+        let inactivity_floor = Location::read(buf)?;
+        let op_count = Location::read(buf)?;
         Ok(Self {
             context,
             parent,
             height,
             digest,
             state_root,
+            inactivity_floor,
+            op_count,
         })
     }
 }
@@ -198,6 +226,8 @@ impl Block {
             height: Height::zero(),
             digest,
             state_root: sha256::Digest::EMPTY,
+            inactivity_floor: Location::new(0),
+            op_count: Location::new(1),
         }
     }
 }
@@ -216,10 +246,10 @@ impl App {
     }
 
     /// Execute a block: increment "counter" and write `height -> height_val`.
-    async fn execute(
+    async fn execute<E: Rng + Spawner + Metrics + Clock + Storage>(
         height: Height,
-        mut batches: <MockDatabaseSet as DatabaseSet>::Unmerkleized,
-    ) -> <MockDatabaseSet as DatabaseSet>::Merkleized {
+        mut batches: <MockDatabaseSet<E> as DatabaseSet<E>>::Unmerkleized,
+    ) -> <MockDatabaseSet<E> as DatabaseSet<E>>::Merkleized {
         // Read current counter
         let current: u64 = batches
             .get(&counter_key())
@@ -236,14 +266,11 @@ impl App {
     }
 }
 
-impl<E> Application<E> for App
-where
-    E: rand::Rng + Spawner + Metrics + Clock,
-{
+impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
     type SigningScheme = MockScheme<ed25519::PublicKey>;
     type Context = Context<sha256::Digest, ed25519::PublicKey>;
     type Block = Block;
-    type Databases = MockDatabaseSet;
+    type Databases = MockDatabaseSet<E>;
     type InputProvider = ();
 
     async fn genesis(&mut self) -> Self::Block {
@@ -254,9 +281,9 @@ where
         &mut self,
         context: (E, Self::Context),
         ancestry: AncestorStream<A, Self::Block>,
-        batches: <Self::Databases as DatabaseSet>::Unmerkleized,
+        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         _input: &mut Self::InputProvider,
-    ) -> Option<(Self::Block, <Self::Databases as DatabaseSet>::Merkleized)> {
+    ) -> Option<(Self::Block, <Self::Databases as DatabaseSet<E>>::Merkleized)> {
         let parent = ancestry.peek()?;
         let parent_digest = parent.digest();
         let height = Height::new(parent.height().get() + 1);
@@ -264,6 +291,8 @@ where
 
         let merkleized = Self::execute(height, batches).await;
         let state_root = merkleized.root();
+        let inactivity_floor = merkleized.inactivity_floor();
+        let op_count = merkleized.size();
 
         let mut hasher = Sha256::new();
         hasher.update(b"e2e_block");
@@ -271,6 +300,8 @@ where
         hasher.update(parent_digest.as_ref());
         hasher.update(&height.get().to_be_bytes());
         hasher.update(state_root.as_ref());
+        hasher.update(&(*inactivity_floor).to_be_bytes());
+        hasher.update(&(*op_count).to_be_bytes());
         let digest = hasher.finalize();
 
         let block = Block {
@@ -279,6 +310,8 @@ where
             height,
             digest,
             state_root,
+            inactivity_floor,
+            op_count,
         };
         Some((block, merkleized))
     }
@@ -287,15 +320,20 @@ where
         &mut self,
         _context: (E, Self::Context),
         ancestry: AncestorStream<A, Self::Block>,
-        batches: <Self::Databases as DatabaseSet>::Unmerkleized,
-    ) -> Option<<Self::Databases as DatabaseSet>::Merkleized> {
+        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
+    ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let tip = ancestry.peek()?;
         let height = tip.height();
 
         let merkleized = Self::execute(height, batches).await;
         let computed_root = merkleized.root();
+        let computed_inactivity_floor = merkleized.inactivity_floor();
+        let computed_op_count = merkleized.size();
 
-        if computed_root != tip.state_root {
+        if computed_root != tip.state_root
+            || computed_inactivity_floor != tip.inactivity_floor
+            || computed_op_count != tip.op_count
+        {
             return None;
         }
 
@@ -306,9 +344,16 @@ where
         &mut self,
         _context: (E, Self::Context),
         block: &Self::Block,
-        batches: <Self::Databases as DatabaseSet>::Unmerkleized,
-    ) -> <Self::Databases as DatabaseSet>::Merkleized {
+        batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
+    ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
         Self::execute(block.height(), batches).await
+    }
+
+    fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
+        Target {
+            root: block.state_root,
+            range: block.inactivity_floor..block.op_count,
+        }
     }
 }
 
@@ -317,6 +362,8 @@ where
 pub(crate) struct ConsensusEngine {
     participants: Vec<ed25519::PublicKey>,
     schemes: Vec<MockScheme<ed25519::PublicKey>>,
+    enable_late_join_state_sync: bool,
+    marshal_mailboxes: Arc<Mutex<BTreeMap<ed25519::PublicKey, MarshalMailbox>>>,
 }
 
 impl ConsensusEngine {
@@ -331,7 +378,93 @@ impl ConsensusEngine {
         Self {
             participants,
             schemes,
+            enable_late_join_state_sync: false,
+            marshal_mailboxes: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    pub(crate) fn with_late_join_state_sync(mut self) -> Self {
+        self.enable_late_join_state_sync = true;
+        self
+    }
+
+    async fn fetch_majority_sync_target(
+        &self,
+        context: &impl Clock,
+        me: &ed25519::PublicKey,
+    ) -> Option<Block> {
+        for _ in 0..20 {
+            let mailboxes = {
+                let guard = self.marshal_mailboxes.lock();
+                guard
+                    .iter()
+                    .filter(|(peer, _)| *peer != me)
+                    .map(|(peer, mailbox)| (peer.clone(), mailbox.clone()))
+                    .collect::<Vec<_>>()
+            };
+
+            if mailboxes.is_empty() {
+                context.sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
+            let mut latest_heights = Vec::new();
+            for (_peer, mailbox) in mailboxes {
+                if let Some((height, _)) = mailbox.get_info(MarshalIdentifier::Latest).await {
+                    latest_heights.push((mailbox, height));
+                }
+            }
+
+            if latest_heights.is_empty() {
+                context.sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
+            let required = latest_heights.len() / 2 + 1;
+
+            // Pick a height that at least `required` peers have reached.
+            let mut heights: Vec<Height> = latest_heights.iter().map(|(_, h)| *h).collect();
+            heights.sort();
+            let quorum_height = heights[heights.len() - required];
+
+            let mut digest_counts: HashMap<sha256::Digest, usize> = HashMap::new();
+            let mut digest_candidates: HashMap<sha256::Digest, Vec<MarshalMailbox>> =
+                HashMap::new();
+            for (mailbox, latest_height) in latest_heights {
+                if latest_height < quorum_height {
+                    continue;
+                }
+                if let Some((_, digest)) = mailbox
+                    .get_info(MarshalIdentifier::Height(quorum_height))
+                    .await
+                {
+                    *digest_counts.entry(digest).or_insert(0) += 1;
+                    digest_candidates.entry(digest).or_default().push(mailbox);
+                }
+            }
+
+            let majority_digest = digest_counts
+                .into_iter()
+                .filter(|(_, count)| *count >= required)
+                .max_by_key(|(_, count)| *count)
+                .map(|(digest, _)| digest);
+
+            if let Some(digest) = majority_digest {
+                if let Some(mailboxes) = digest_candidates.get(&digest) {
+                    for mailbox in mailboxes {
+                        if let Some(block) =
+                            mailbox.get_block(MarshalIdentifier::Digest(digest)).await
+                        {
+                            return Some(block);
+                        }
+                    }
+                }
+            }
+
+            context.sleep(Duration::from_millis(100)).await;
+        }
+
+        None
     }
 }
 
@@ -351,6 +484,7 @@ impl EngineDefinition for ConsensusEngine {
             (2, TEST_QUOTA), // resolver
             (3, TEST_QUOTA), // backfill
             (4, TEST_QUOTA), // broadcast
+            (5, TEST_QUOTA), // qmdb sync resolver
         ]
     }
 
@@ -370,32 +504,28 @@ impl EngineDefinition for ConsensusEngine {
         let partition_prefix = format!("validator-{index}");
         let page_cache = CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE);
 
-        // Initialize QMDB database
-        let qmdb = Qmdb::init(
-            context.clone(),
-            FixedConfig {
-                mmr_journal_partition: format!("{partition_prefix}-qmdb-mmr-journal"),
-                mmr_metadata_partition: format!("{partition_prefix}-qmdb-mmr-metadata"),
-                mmr_items_per_blob: NZU64!(11),
-                mmr_write_buffer: NZUsize!(1024),
-                log_journal_partition: format!("{partition_prefix}-qmdb-log-journal"),
-                log_items_per_blob: NZU64!(7),
-                log_write_buffer: NZUsize!(1024),
-                translator: TwoCap::default(),
-                thread_pool: None,
-                page_cache: page_cache.clone(),
-            },
-        )
-        .await
-        .expect("failed to initialize QMDB");
-        let db: MockDatabaseSet = Arc::new(AsyncRwLock::new(qmdb));
-        // Destructure the 5 channels
+        // QMDB database config (created by Stateful::start)
+        let db_config = FixedConfig {
+            mmr_journal_partition: format!("{partition_prefix}-qmdb-mmr-journal"),
+            mmr_metadata_partition: format!("{partition_prefix}-qmdb-mmr-metadata"),
+            mmr_items_per_blob: NZU64!(11),
+            mmr_write_buffer: IO_BUFFER_SIZE,
+            log_journal_partition: format!("{partition_prefix}-qmdb-log-journal"),
+            log_items_per_blob: NZU64!(7),
+            log_write_buffer: IO_BUFFER_SIZE,
+            translator: TwoCap,
+            thread_pool: None,
+            page_cache: page_cache.clone(),
+        };
+
+        // Destructure the 6 channels.
         let mut channels = channels.into_iter();
         let vote_network = channels.next().unwrap();
         let certificate_network = channels.next().unwrap();
         let resolver_network = channels.next().unwrap();
         let backfill_network = channels.next().unwrap();
         let broadcast_network = channels.next().unwrap();
+        let qmdb_resolver_network = channels.next().unwrap();
 
         // Marshal resolver
         let resolver_cfg = marshal_resolver::Config {
@@ -441,10 +571,10 @@ impl EngineDefinition for ConsensusEngine {
                 items_per_section: NZU64!(10),
                 codec_config: MockScheme::<ed25519::PublicKey>::certificate_codec_config_unbounded(
                 ),
-                replay_buffer: NZUsize!(1024),
-                freezer_key_write_buffer: NZUsize!(1024),
-                freezer_value_write_buffer: NZUsize!(1024),
-                ordinal_write_buffer: NZUsize!(1024),
+                replay_buffer: IO_BUFFER_SIZE,
+                freezer_key_write_buffer: IO_BUFFER_SIZE,
+                freezer_value_write_buffer: IO_BUFFER_SIZE,
+                ordinal_write_buffer: IO_BUFFER_SIZE,
             },
         )
         .await
@@ -466,10 +596,10 @@ impl EngineDefinition for ConsensusEngine {
                 ordinal_partition: format!("{partition_prefix}-blocks-ordinal"),
                 items_per_section: NZU64!(10),
                 codec_config: (),
-                replay_buffer: NZUsize!(1024),
-                freezer_key_write_buffer: NZUsize!(1024),
-                freezer_value_write_buffer: NZUsize!(1024),
-                ordinal_write_buffer: NZUsize!(1024),
+                replay_buffer: IO_BUFFER_SIZE,
+                freezer_key_write_buffer: IO_BUFFER_SIZE,
+                freezer_value_write_buffer: IO_BUFFER_SIZE,
+                ordinal_write_buffer: IO_BUFFER_SIZE,
             },
         )
         .await
@@ -485,9 +615,9 @@ impl EngineDefinition for ConsensusEngine {
             view_retention_timeout: ViewDelta::new(10),
             prunable_items_per_section: NZU64!(10),
             page_cache: page_cache.clone(),
-            replay_buffer: NZUsize!(1024),
-            key_write_buffer: NZUsize!(1024),
-            value_write_buffer: NZUsize!(1024),
+            replay_buffer: IO_BUFFER_SIZE,
+            key_write_buffer: IO_BUFFER_SIZE,
+            value_write_buffer: IO_BUFFER_SIZE,
             block_codec_config: (),
             max_repair: NZUsize!(10),
             max_pending_acks: NZUsize!(1),
@@ -501,6 +631,40 @@ impl EngineDefinition for ConsensusEngine {
                 marshal_config,
             )
             .await;
+        self.marshal_mailboxes
+            .lock()
+            .insert(public_key.clone(), marshal_mailbox.clone());
+
+        // QMDB state-sync resolver.
+        let qmdb_resolver_actor =
+            qmdb_resolver::Actor::<_, ed25519::PublicKey, _, _, Qmdb<_>, _, _>::new(
+                context.clone().with_label("qmdb_resolver"),
+                qmdb_resolver::Config {
+                    peer_provider: oracle.manager(),
+                    blocker: oracle.control(public_key.clone()),
+                    database: None,
+                    mailbox_size: 100,
+                    me: Some(public_key.clone()),
+                    initial: Duration::from_secs(1),
+                    timeout: Duration::from_secs(2),
+                    fetch_retry_timeout: Duration::from_millis(100),
+                    priority_requests: false,
+                    priority_responses: false,
+                },
+            );
+        let (_qmdb_resolver_handle, qmdb_sync_resolver) =
+            qmdb_resolver_actor.start(qmdb_resolver_network);
+
+        let (startup, startup_sync_height) = if self.enable_late_join_state_sync {
+            self.fetch_majority_sync_target(&context, public_key)
+                .await
+                .map_or((Startup::Fresh, None), |block| {
+                    let height = block.height().get();
+                    (Startup::Sync { block }, Some(height))
+                })
+        } else {
+            (Startup::Fresh, None)
+        };
 
         // Stateful actor
         let app = App::new();
@@ -508,10 +672,21 @@ impl EngineDefinition for ConsensusEngine {
             context.clone(),
             StatefulConfig {
                 app,
-                databases: db.clone(),
+                db_config,
                 input_provider: (),
                 marshal: marshal_mailbox.clone(),
                 mailbox_size: 100,
+                state_sync: StateSyncConfig {
+                    partition_prefix: partition_prefix.clone(),
+                    startup,
+                    resolvers: qmdb_sync_resolver.clone(),
+                    sync_config: SyncEngineConfig {
+                        fetch_batch_size: NZU64!(16),
+                        apply_batch_size: 64,
+                        max_outstanding_requests: 8,
+                        update_channel_size: NZUsize!(256),
+                    },
+                },
             },
         );
 
@@ -530,7 +705,7 @@ impl EngineDefinition for ConsensusEngine {
         marshal_actor.start(marshal_reporters, buffer, resolver);
 
         // Initialize stateful from marshal's processed frontier.
-        stateful_actor.start().await;
+        stateful_actor.start();
 
         // Simplex engine
         let simplex_config = simplex::Config {
@@ -544,8 +719,8 @@ impl EngineDefinition for ConsensusEngine {
             partition: format!("{partition_prefix}-simplex"),
             mailbox_size: 100,
             epoch: Epoch::zero(),
-            replay_buffer: NZUsize!(1024),
-            write_buffer: NZUsize!(1024),
+            replay_buffer: IO_BUFFER_SIZE,
+            write_buffer: IO_BUFFER_SIZE,
             page_cache,
             leader_timeout: Duration::from_secs(1),
             certification_timeout: Duration::from_secs(2),
@@ -563,8 +738,8 @@ impl EngineDefinition for ConsensusEngine {
         (
             handle,
             MockValidatorState {
-                _db: db,
                 marshal: marshal_mailbox,
+                startup_sync_height,
             },
         )
     }
