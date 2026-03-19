@@ -52,11 +52,13 @@ use commonware_storage::{
     translator::TwoCap,
 };
 use commonware_utils::{
+    non_empty_range,
+    range::NonEmptyRange,
     sync::{AsyncRwLock, Mutex},
     test_rng, NZUsize, NZU64,
 };
 use rand::Rng;
-use std::{collections::BTreeMap, ops::Range, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 /// The QMDB database type used by the multi-db e2e tests.
 type Qmdb<E> = fixed::Db<E, sha256::Digest, sha256::Digest, Sha256, TwoCap>;
@@ -76,9 +78,9 @@ pub(crate) struct Block {
     parent: sha256::Digest,
     height: Height,
     root_a: sha256::Digest,
-    range_a: Range<Location>,
+    range_a: NonEmptyRange<Location>,
     root_b: sha256::Digest,
-    range_b: Range<Location>,
+    range_b: NonEmptyRange<Location>,
 }
 
 impl Write for Block {
@@ -114,9 +116,9 @@ impl Read for Block {
             parent: sha256::Digest::read(buf)?,
             height: Height::read(buf)?,
             root_a: sha256::Digest::read(buf)?,
-            range_a: Range::read(buf)?,
+            range_a: NonEmptyRange::read(buf)?,
             root_b: sha256::Digest::read(buf)?,
-            range_b: Range::read(buf)?,
+            range_b: NonEmptyRange::read(buf)?,
         })
     }
 }
@@ -160,9 +162,9 @@ impl Block {
             parent: sha256::Digest::EMPTY,
             height: Height::zero(),
             root_a: sha256::Digest::EMPTY,
-            range_a: Location::new(0)..Location::new(1),
+            range_a: non_empty_range!(Location::new(0), Location::new(1)),
             root_b: sha256::Digest::EMPTY,
-            range_b: Location::new(0)..Location::new(1),
+            range_b: non_empty_range!(Location::new(0), Location::new(1)),
         }
     }
 }
@@ -243,9 +245,9 @@ impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
             parent: parent.digest(),
             height,
             root_a: merkleized_a.root(),
-            range_a: merkleized_a.inactivity_floor()..merkleized_a.size(),
+            range_a: non_empty_range!(merkleized_a.inactivity_floor(), merkleized_a.size()),
             root_b: merkleized_b.root(),
-            range_b: merkleized_b.inactivity_floor()..merkleized_b.size(),
+            range_b: non_empty_range!(merkleized_b.inactivity_floor(), merkleized_b.size()),
         };
         Some(Proposed {
             block,
@@ -262,9 +264,11 @@ impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
         let tip = ancestry.peek()?;
         let (merkleized_a, merkleized_b) = Self::execute(tip.height(), batches).await;
         let matches_a = merkleized_a.root() == tip.root_a
-            && (merkleized_a.inactivity_floor()..merkleized_a.size()) == tip.range_a;
+            && non_empty_range!(merkleized_a.inactivity_floor(), merkleized_a.size())
+                == tip.range_a;
         let matches_b = merkleized_b.root() == tip.root_b
-            && (merkleized_b.inactivity_floor()..merkleized_b.size()) == tip.range_b;
+            && non_empty_range!(merkleized_b.inactivity_floor(), merkleized_b.size())
+                == tip.range_b;
         if !matches_a || !matches_b {
             return None;
         }

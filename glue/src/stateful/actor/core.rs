@@ -882,6 +882,7 @@ mod tests {
     use commonware_storage::{mmr::Location, qmdb::sync::Target};
     use commonware_utils::{
         channel::{mpsc, oneshot},
+        range::NonEmptyRange,
         NZUsize,
     };
     use std::{
@@ -1496,7 +1497,7 @@ mod tests {
         ) -> <Self::Databases as DatabaseSet<deterministic::Context>>::SyncTargets {
             vec![Target {
                 root: block.digest(),
-                range: Location::new(0)..Location::new(100),
+                range: NonEmptyRange::new(Location::new(0)..Location::new(100)).unwrap(),
             }]
         }
     }
@@ -1542,7 +1543,7 @@ mod tests {
             assert_eq!(received.targets[0].root, block1.digest());
             assert_eq!(
                 received.targets[0].range,
-                Location::new(0)..Location::new(100),
+                NonEmptyRange::new(Location::new(0)..Location::new(100)).unwrap(),
             );
         });
     }

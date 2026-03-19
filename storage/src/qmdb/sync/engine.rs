@@ -622,7 +622,7 @@ mod tests {
     use super::*;
     use crate::mmr::Proof;
     use commonware_cryptography::sha256;
-    use commonware_utils::channel::oneshot;
+    use commonware_utils::{channel::oneshot, non_empty_range};
 
     #[test]
     fn test_outstanding_requests() {
@@ -657,11 +657,11 @@ mod tests {
     fn duplicate_target_updates_are_ignored() {
         let target = Target {
             root: sha256::Digest::from([7; 32]),
-            range: Location::new(10)..Location::new(20),
+            range: non_empty_range!(Location::new(10), Location::new(20)),
         };
         let distinct = Target {
             root: sha256::Digest::from([8; 32]),
-            range: Location::new(10)..Location::new(20),
+            range: non_empty_range!(Location::new(10), Location::new(20)),
         };
 
         assert!(is_duplicate_target_update(&target, &target));

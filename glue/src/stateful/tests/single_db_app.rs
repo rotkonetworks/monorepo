@@ -51,11 +51,13 @@ use commonware_storage::{
     translator::TwoCap,
 };
 use commonware_utils::{
+    non_empty_range,
+    range::NonEmptyRange,
     sync::{AsyncRwLock, Mutex},
     test_rng, NZUsize, NZU64,
 };
 use rand::Rng;
-use std::{collections::BTreeMap, ops::Range, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 /// The QMDB database type used by the single-db e2e tests.
 type Qmdb<E> = fixed::Db<E, sha256::Digest, sha256::Digest, Sha256, TwoCap>;
@@ -70,7 +72,7 @@ pub(crate) struct Block {
     parent: sha256::Digest,
     height: Height,
     state_root: sha256::Digest,
-    range: Range<Location>,
+    range: NonEmptyRange<Location>,
 }
 
 impl Write for Block {
@@ -102,7 +104,7 @@ impl Read for Block {
             parent: sha256::Digest::read(buf)?,
             height: Height::read(buf)?,
             state_root: sha256::Digest::read(buf)?,
-            range: Range::read(buf)?,
+            range: NonEmptyRange::read(buf)?,
         })
     }
 }
@@ -146,7 +148,7 @@ impl Block {
             parent: sha256::Digest::EMPTY,
             height: Height::zero(),
             state_root: sha256::Digest::EMPTY,
-            range: Location::new(0)..Location::new(1),
+            range: non_empty_range!(Location::new(0), Location::new(1)),
         }
     }
 }
@@ -210,7 +212,7 @@ impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
             parent: parent.digest(),
             height,
             state_root: merkleized.root(),
-            range: merkleized.inactivity_floor()..merkleized.size(),
+            range: non_empty_range!(merkleized.inactivity_floor(), merkleized.size()),
         };
         Some(Proposed { block, merkleized })
     }
@@ -224,7 +226,7 @@ impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
         let tip = ancestry.peek()?;
         let merkleized = Self::execute(tip.height(), batches).await;
         if merkleized.root() != tip.state_root
-            || (merkleized.inactivity_floor()..merkleized.size()) != tip.range
+            || non_empty_range!(merkleized.inactivity_floor(), merkleized.size()) != tip.range
         {
             return None;
         }
