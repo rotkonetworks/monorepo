@@ -1386,9 +1386,11 @@ dependencies = [
 name = "commonware-glue"
 version = "2026.3.0"
 dependencies = [
+ "arbitrary",
  "bytes",
  "commonware-broadcast",
  "commonware-codec",
+ "commonware-conformance",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-macros",
@@ -1399,8 +1401,10 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "futures",
+ "prometheus-client",
  "rand 0.8.5",
  "rand_core 0.6.4",
+ "thiserror 2.0.17",
  "tracing",
  "tracing-subscriber",
 ]

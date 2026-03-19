@@ -63,7 +63,7 @@ where
     /// to `Mode::Running`.
     SyncComplete {
         databases: A::Databases,
-        finalized_digest: <A::Block as Digestible>::Digest,
+        last_processed_digest: <A::Block as Digestible>::Digest,
     },
 }
 
@@ -113,12 +113,12 @@ where
     pub async fn sync_complete(
         &self,
         databases: A::Databases,
-        finalized_digest: <A::Block as Digestible>::Digest,
+        last_processed_digest: <A::Block as Digestible>::Digest,
     ) {
         self.sender
             .send(Message::SyncComplete {
                 databases,
-                finalized_digest,
+                last_processed_digest,
             })
             .await
             .expect("stateful actor dropped during sync_complete");

@@ -160,7 +160,6 @@ where
 
     /// Newer target to apply after the current target completes.
     queued_target: Option<Target<DB::Digest>>,
-
 }
 
 #[cfg(test)]

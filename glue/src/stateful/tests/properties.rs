@@ -1,8 +1,7 @@
-use crate::{
-    simulate::{processed::ProcessedHeight, property::Property, tracker::ProgressTracker},
-    stateful::tests::app::MockValidatorState,
-};
-use commonware_cryptography::ed25519;
+use super::common::MockValidatorState;
+use crate::simulate::{processed::ProcessedHeight, property::Property, tracker::ProgressTracker};
+use commonware_consensus::marshal::core::Variant;
+use commonware_cryptography::{ed25519, sha256, Digestible};
 use std::{future::Future, pin::Pin};
 
 /// Post-run property: all validators agree on the finalized block at `height`.
@@ -10,7 +9,12 @@ pub(crate) struct BlockAgreementAtHeight {
     pub(crate) height: u64,
 }
 
-impl Property<ed25519::PublicKey, MockValidatorState> for BlockAgreementAtHeight {
+impl<V> Property<ed25519::PublicKey, MockValidatorState<V>> for BlockAgreementAtHeight
+where
+    V: Variant,
+    V::ApplicationBlock: Digestible<Digest = sha256::Digest>,
+    MockValidatorState<V>: Send + Sync,
+{
     fn name(&self) -> &str {
         "block_agreement_at_height"
     }
@@ -18,7 +22,7 @@ impl Property<ed25519::PublicKey, MockValidatorState> for BlockAgreementAtHeight
     fn check<'a>(
         &'a self,
         _tracker: &'a ProgressTracker<ed25519::PublicKey>,
-        states: &'a [&'a MockValidatorState],
+        states: &'a [&'a MockValidatorState<V>],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             let mut expected = None;
@@ -49,7 +53,12 @@ impl Property<ed25519::PublicKey, MockValidatorState> for BlockAgreementAtHeight
 /// Post-run property: at least one node used startup state sync and then advanced further.
 pub(crate) struct LateJoinerStateSyncHandoff;
 
-impl Property<ed25519::PublicKey, MockValidatorState> for LateJoinerStateSyncHandoff {
+impl<V> Property<ed25519::PublicKey, MockValidatorState<V>> for LateJoinerStateSyncHandoff
+where
+    V: Variant,
+    V::ApplicationBlock: Digestible<Digest = sha256::Digest>,
+    MockValidatorState<V>: Send + Sync,
+{
     fn name(&self) -> &str {
         "late_joiner_state_sync_handoff"
     }
@@ -57,7 +66,7 @@ impl Property<ed25519::PublicKey, MockValidatorState> for LateJoinerStateSyncHan
     fn check<'a>(
         &'a self,
         _tracker: &'a ProgressTracker<ed25519::PublicKey>,
-        states: &'a [&'a MockValidatorState],
+        states: &'a [&'a MockValidatorState<V>],
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             for state in states {

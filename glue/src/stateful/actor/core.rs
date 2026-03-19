@@ -33,7 +33,7 @@ use crate::stateful::{
         Mailbox,
     },
     db::{qmdb::resolver::AttachableResolverSet, DatabaseSet, StateSyncSet},
-    Application,
+    Application, Proposed,
 };
 use commonware_consensus::{
     marshal::{self, ancestry::BlockProvider},
@@ -54,16 +54,21 @@ use tracing::{debug, info};
 
 type PendingDigest<A, E> = <<A as Application<E>>::Block as Digestible>::Digest;
 type PendingBatches<A, E> = <<A as Application<E>>::Databases as DatabaseSet<E>>::Merkleized;
-type PendingEntry<A, E> = (Round, PendingBatches<A, E>);
+type PendingMap<A, E> = HashMap<PendingDigest<A, E>, (Round, PendingBatches<A, E>)>;
 type PendingSyncTip<A, E> = SyncTip<
     <<A as Application<E>>::Databases as DatabaseSet<E>>::SyncTargets,
     <<A as Application<E>>::Block as Digestible>::Digest,
 >;
-type RunningState<'a, A, E> = (
-    &'a mut <A as Application<E>>::Databases,
-    &'a mut Pending<A, E>,
-    &'a mut <<A as Application<E>>::Block as Digestible>::Digest,
-);
+/// Mutable view into the [`State::Running`] fields.
+struct RunningState<'a, A, E>
+where
+    A: Application<E>,
+    E: Rng + Spawner + Metrics + Clock,
+{
+    databases: &'a mut A::Databases,
+    pending: &'a mut PendingMap<A, E>,
+    last_processed_digest: &'a mut <A::Block as Digestible>::Digest,
+}
 
 const STATE_SYNC_METADATA_SUFFIX: &str = "_state_sync_metadata";
 
@@ -114,142 +119,76 @@ where
     }
 }
 
-/// Pending merkleized batches keyed by block digest.
-struct Pending<A, E>
-where
-    A: Application<E>,
-    E: Rng + Spawner + Metrics + Clock,
-{
-    entries: HashMap<PendingDigest<A, E>, PendingEntry<A, E>>,
-}
-
-impl<A, E> Pending<A, E>
-where
-    A: Application<E>,
-    E: Rng + Spawner + Metrics + Clock,
-{
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
-    }
-
-    fn contains(&self, digest: &PendingDigest<A, E>) -> bool {
-        self.entries.contains_key(digest)
-    }
-
-    fn get_merkleized(&self, digest: &PendingDigest<A, E>) -> Option<&PendingBatches<A, E>> {
-        self.entries.get(digest).map(|(_, merkleized)| merkleized)
-    }
-
-    fn insert(
-        &mut self,
-        digest: PendingDigest<A, E>,
-        round: Round,
-        merkleized: PendingBatches<A, E>,
-    ) {
-        self.entries.insert(digest, (round, merkleized));
-    }
-
-    fn remove(&mut self, digest: &PendingDigest<A, E>) -> Option<PendingEntry<A, E>> {
-        self.entries.remove(digest)
-    }
-
-    fn retain_newer_than(&mut self, finalized_round: Round) {
-        self.entries
-            .retain(|_, (round, _)| *round > finalized_round);
-    }
-}
-
-/// Startup lifecycle for one actor instance.
-enum StartupState<E, A, R>
+/// Stateful actor lifecycle.
+enum State<E, A, R>
 where
     E: Rng + Spawner + Metrics + Clock,
     A: Application<E>,
 {
-    /// Configuration has not been consumed by [`Stateful::start`] yet.
-    Pending {
+    /// Actor has been initialized but not started yet.
+    NotStarted {
+        /// Configuration used to initialize the database set at startup.
         db_config: <A::Databases as DatabaseSet<E>>::Config,
+
+        /// One-time startup state-sync configuration.
         state_sync: StateSyncConfig<E, A, R>,
-        tip_updates: mpsc::Receiver<PendingSyncTip<A, E>>,
     },
 
-    /// Startup completed and resolver attachment is available.
-    Started { sync_resolvers: R },
-
-    /// Temporary sentinel while consuming [`Pending`](Self::Pending) in `start`.
-    Consumed,
-}
-
-/// Operating mode of the [`Stateful`] actor.
-///
-/// Instances are initialized in [`Syncing`](Mode::Syncing) and transition to
-/// [`Running`](Mode::Running) when startup bootstrap calls
-/// [`Mailbox::sync_complete`].
-enum Mode<A, E>
-where
-    A: Application<E>,
-    E: Rng + Spawner + Metrics + Clock,
-{
-    /// State-sync mode: databases are not yet available.
-    ///
-    /// Proposals are rejected. Verify response channels are held without
-    /// responding so upstream verification requests time out naturally.
-    /// Finalization acknowledgements are held so marshal does not advance
-    /// past our sync target.
+    /// Actor is syncing startup state.
     Syncing {
-        /// Verify response channels received while syncing.
-        ///
-        /// We never respond to these requests while syncing to avoid voting
-        /// against potentially-valid blocks. Closed channels are pruned as
-        /// new verify requests arrive.
+        /// Verify responses held while syncing.
         held_verify_responses: Vec<oneshot::Sender<bool>>,
 
-        /// Finalization acknowledgements held during sync. Dropping them
-        /// without acknowledging prevents marshal from advancing past our
-        /// sync target. They are discarded on [`Message::SyncComplete`]
-        /// after `set_floor` has made them irrelevant.
+        /// Finalization acknowledgements held while syncing.
         held_acks: Vec<Exact>,
 
-        /// Channel to forward sync tips to the background sync
-        /// orchestrator. Each tip bundles the finalized block's height,
-        /// digest, and per-database sync targets.
+        /// Sync target updates forwarded to the bootstrap sync task.
         tip_sender: mpsc::Sender<PendingSyncTip<A, E>>,
+
+        /// Resolver set attached once sync completes.
+        sync_resolvers: R,
     },
 
-    /// Normal consensus operation.
+    /// Actor is running normal consensus execution with marshal backfill sync.
     Running {
         /// The set of databases whose batch lifecycle is managed by this wrapper.
         databases: A::Databases,
 
         /// Pending merkleized batches keyed by block digest, tagged with the
         /// round in which they were produced.
-        pending: Pending<A, E>,
+        pending: PendingMap<A, E>,
 
         /// The latest observed finalized block digest.
         ///
         /// TODO: Rename "processed_digest" or "finalized_tip_digest" or
         /// something less ambiguous, since this isn't the latest finalized
         /// digest. Just the latest that we've processed locally.
-        finalized_digest: <A::Block as Digestible>::Digest,
+        last_processed_digest: <A::Block as Digestible>::Digest,
     },
 }
 
-impl<A, E> Mode<A, E>
+impl<E, A, R> State<E, A, R>
 where
-    A: Application<E>,
     E: Rng + Spawner + Metrics + Clock,
+    A: Application<E>,
 {
-    /// Returns mutable references to `Running` state, panicking if syncing.
-    fn running(&mut self) -> RunningState<'_, A, E> {
+    /// Returns mutable references to `Running` state.
+    fn state(&mut self) -> RunningState<'_, A, E> {
         match self {
             Self::Running {
                 databases,
                 pending,
-                finalized_digest,
-            } => (databases, pending, finalized_digest),
+                last_processed_digest,
+            } => RunningState {
+                databases,
+                pending,
+                last_processed_digest,
+            },
+            Self::NotStarted { .. } => {
+                panic!("running state requested while actor is NotStarted")
+            }
             Self::Syncing { .. } => {
-                panic!("stateful actor called in syncing mode")
+                panic!("running state requested while actor is Syncing")
             }
         }
     }
@@ -312,11 +251,8 @@ where
     /// Marshal mailbox used for startup anchoring and lazy recovery.
     marshal: P,
 
-    /// One-time startup lifecycle.
-    startup: StartupState<E, A, R>,
-
-    /// Current operating mode (syncing or running).
-    mode: Mode<A, E>,
+    /// Current actor lifecycle state.
+    state: State<E, A, R>,
 }
 
 impl<E, A, P, R> Stateful<E, A, P, R>
@@ -331,8 +267,6 @@ where
     /// not process messages until [`Stateful::start`] is called.
     pub fn init(context: E, config: Config<E, A, P, R>) -> (Self, Mailbox<E, A>) {
         let (sender, mailbox) = mpsc::channel(config.mailbox_size);
-        let (tip_sender, tip_updates) =
-            mpsc::channel(config.state_sync.sync_config.update_channel_size.get());
         (
             Self {
                 sender: sender.clone(),
@@ -341,15 +275,9 @@ where
                 inner: config.app,
                 input_provider: config.input_provider,
                 marshal: config.marshal,
-                startup: StartupState::Pending {
+                state: State::NotStarted {
                     db_config: config.db_config,
                     state_sync: config.state_sync,
-                    tip_updates,
-                },
-                mode: Mode::Syncing {
-                    held_verify_responses: Vec::new(),
-                    held_acks: Vec::new(),
-                    tip_sender,
                 },
             },
             Mailbox::new(sender),
@@ -372,24 +300,22 @@ where
         P: Into<marshal::core::Mailbox<S, V>>,
         R: Clone + Send + AttachableResolverSet<A::Databases> + 'static,
     {
-        let startup = std::mem::replace(&mut self.startup, StartupState::Consumed);
-        let StartupState::Pending {
+        let State::NotStarted {
             db_config,
-            state_sync: config,
-            tip_updates,
-        } = startup
+            state_sync,
+        } = self.state
         else {
-            panic!("start called more than once");
+            panic!("stateful actor must be NotStarted before start");
         };
-
         let StateSyncConfig {
             partition_prefix,
             startup,
             resolvers,
             sync_config,
-        } = config;
-        let metadata_partition = format!("{partition_prefix}{STATE_SYNC_METADATA_SUFFIX}");
+        } = state_sync;
+        let (tip_sender, tip_updates) = mpsc::channel(sync_config.update_channel_size.get());
 
+        let metadata_partition = format!("{partition_prefix}{STATE_SYNC_METADATA_SUFFIX}");
         let bootstrap_startup = match startup {
             Startup::Fresh => BootstrapStartup::Fresh,
             Startup::Sync { block } => BootstrapStartup::Sync {
@@ -402,10 +328,16 @@ where
                 resolvers: resolvers.clone(),
             },
         };
-        self.startup = StartupState::Started {
-            sync_resolvers: resolvers,
-        };
 
+        self = Self {
+            state: State::Syncing {
+                held_verify_responses: Vec::new(),
+                held_acks: Vec::new(),
+                tip_sender,
+                sync_resolvers: resolvers,
+            },
+            ..self
+        };
         let context = self.context.clone().into_present();
         let bootstrap_config = BootstrapConfig {
             context: context.with_label("state_sync"),
@@ -432,7 +364,7 @@ where
     /// - all mailbox senders are dropped.
     async fn run(mut self)
     where
-        R: AttachableResolverSet<A::Databases>,
+        R: Clone + AttachableResolverSet<A::Databases>,
     {
         select_loop! {
             self.context,
@@ -457,8 +389,8 @@ where
                     Message::Tip { height, digest } => {
                         self.handle_tip(height, digest).await;
                     },
-                    Message::SyncComplete { databases, finalized_digest } => {
-                        self.handle_sync_complete(databases, finalized_digest).await;
+                    Message::SyncComplete { databases, last_processed_digest } => {
+                        self.handle_sync_complete(databases, last_processed_digest).await;
                     }
                 }
             }
@@ -478,10 +410,16 @@ where
         ancestry: ErasedAncestorStream<A::Block>,
         mut response: oneshot::Sender<Option<A::Block>>,
     ) {
-        if matches!(self.mode, Mode::Syncing { .. }) {
-            debug!("proposal rejected: state sync in progress");
-            response.send_lossy(None);
-            return;
+        match &self.state {
+            State::Running { .. } => {}
+            State::Syncing { .. } => {
+                debug!("proposal rejected: state sync in progress");
+                response.send_lossy(None);
+                return;
+            }
+            State::NotStarted { .. } => {
+                panic!("propose received before actor start");
+            }
         }
 
         // The ancestry stream starts from the parent block.
@@ -529,12 +467,12 @@ where
 
         // Cache the built block's pending state for later verification jobs
         // and finalization.
-        let Some((block, merkleized)) = proposed else {
+        let Some(Proposed { block, merkleized }) = proposed else {
             response.send_lossy(None);
             return;
         };
-        let (_, pending, _) = self.mode.running();
-        pending.insert(block.digest(), round, merkleized);
+        let RunningState { pending, .. } = self.state.state();
+        pending.insert(block.digest(), (round, merkleized));
 
         // Send the built block back to the application.
         response.send_lossy(Some(block));
@@ -547,18 +485,23 @@ where
         ancestry: ErasedAncestorStream<A::Block>,
         mut response: oneshot::Sender<bool>,
     ) {
-        if let Mode::Syncing {
-            held_verify_responses,
-            ..
-        } = &mut self.mode
-        {
-            held_verify_responses.retain(|response| !response.is_closed());
-            held_verify_responses.push(response);
-            debug!(
-                held_verify_responses = held_verify_responses.len(),
-                "verify held: state sync in progress"
-            );
-            return;
+        match &mut self.state {
+            State::Running { .. } => {}
+            State::Syncing {
+                held_verify_responses,
+                ..
+            } => {
+                held_verify_responses.retain(|response| !response.is_closed());
+                held_verify_responses.push(response);
+                debug!(
+                    held_verify_responses = held_verify_responses.len(),
+                    "verify held: state sync in progress"
+                );
+                return;
+            }
+            State::NotStarted { .. } => {
+                panic!("verify received before actor start");
+            }
         }
 
         let Some(block) = ancestry.peek() else {
@@ -609,8 +552,8 @@ where
             response.send_lossy(false);
             return;
         };
-        let (_, pending, _) = self.mode.running();
-        pending.insert(block_digest, round, merkleized);
+        let RunningState { pending, .. } = self.state.state();
+        pending.insert(block_digest, (round, merkleized));
 
         // Inform the application that the block is valid.
         response.send_lossy(true);
@@ -618,21 +561,31 @@ where
 
     /// Handles a [`Message::Finalized`].
     async fn handle_finalized(&mut self, block: A::Block, acknowledgement: Exact) {
-        if let Mode::Syncing { held_acks, .. } = &mut self.mode {
-            debug!(
-                height = block.height().get(),
-                "finalization held during sync (not yet acknowledged)"
-            );
-            held_acks.push(acknowledgement);
-            return;
+        match &mut self.state {
+            State::Running { .. } => {}
+            State::Syncing { held_acks, .. } => {
+                debug!(
+                    height = block.height().get(),
+                    "finalization held during sync (not yet acknowledged)"
+                );
+                held_acks.push(acknowledgement);
+                return;
+            }
+            State::NotStarted { .. } => {
+                panic!("finalized received before actor start");
+            }
         }
 
-        let (databases, pending, finalized_digest) = self.mode.running();
+        let RunningState {
+            databases,
+            pending,
+            last_processed_digest,
+        } = self.state.state();
 
         // Duplicate finalization reports are benign. A node may
         // observe the same finalization certificate multiple times
         // from replay or the network.
-        if *finalized_digest == block.digest() {
+        if *last_processed_digest == block.digest() {
             acknowledgement.acknowledge();
             return;
         }
@@ -655,8 +608,8 @@ where
         // block.
         let round = Round::new(block.context().epoch(), block.context().view());
         databases.finalize(batch).await;
-        pending.retain_newer_than(round);
-        *finalized_digest = block.digest();
+        pending.retain(|_, (r, _)| *r > round);
+        *last_processed_digest = block.digest();
         acknowledgement.acknowledge();
 
         info!(
@@ -667,14 +620,18 @@ where
 
     /// Handles a [`Message::Tip`].
     ///
-    /// In [`Mode::Syncing`], fetches the block from marshal, extracts
+    /// In [`State::Syncing`], fetches the block from marshal, extracts
     /// per-database sync targets via [`Application::sync_targets`], and
     /// forwards them to the background sync engines.
     ///
-    /// In [`Mode::Running`], this is a no-op.
+    /// In [`State::Running`], this is a no-op.
     async fn handle_tip(&mut self, height: Height, digest: <A::Block as Digestible>::Digest) {
-        let Mode::Syncing { tip_sender, .. } = &self.mode else {
-            return;
+        let tip_sender = match &self.state {
+            State::Syncing { tip_sender, .. } => tip_sender,
+            State::Running { .. } => return,
+            State::NotStarted { .. } => {
+                panic!("tip received before actor start");
+            }
         };
 
         let Some(block) = self.marshal.clone().fetch_block(digest).await else {
@@ -703,42 +660,41 @@ where
 
     /// Handles a [`Message::SyncComplete`].
     ///
-    /// Transitions from [`Mode::Syncing`] to [`Mode::Running`].
+    /// Transitions from [`State::Syncing`] to [`State::Running`].
     ///
     /// Any held verify response channels are dropped without sending a
     /// response so their callers can time out naturally.
     async fn handle_sync_complete(
         &mut self,
         databases: A::Databases,
-        finalized_digest: <A::Block as Digestible>::Digest,
+        last_processed_digest: <A::Block as Digestible>::Digest,
     ) where
-        R: AttachableResolverSet<A::Databases>,
+        R: Clone + AttachableResolverSet<A::Databases>,
     {
-        let (held_verify_responses, held_acks) = match &mut self.mode {
-            Mode::Syncing {
+        let (held_verify_responses, held_acks, sync_resolvers) = match &mut self.state {
+            State::Syncing {
                 held_verify_responses,
                 held_acks,
+                sync_resolvers,
                 ..
             } => (
                 std::mem::take(held_verify_responses),
                 std::mem::take(held_acks),
+                sync_resolvers.clone(),
             ),
-            Mode::Running { .. } => {
-                panic!("SyncComplete received while already in Running mode");
+            State::NotStarted { .. } => {
+                panic!("SyncComplete received while not started");
             }
-        };
-        let sync_resolvers = match &self.startup {
-            StartupState::Started { sync_resolvers } => sync_resolvers,
-            StartupState::Pending { .. } | StartupState::Consumed => {
-                panic!("SyncComplete received before startup reached Started state");
+            State::Running { .. } => {
+                panic!("SyncComplete received while already running");
             }
         };
         sync_resolvers.attach_databases(databases.clone()).await;
 
-        self.mode = Mode::Running {
+        self.state = State::Running {
             databases,
-            pending: Pending::new(),
-            finalized_digest,
+            pending: HashMap::new(),
+            last_processed_digest,
         };
 
         let held_verifies = held_verify_responses.len();
@@ -769,8 +725,12 @@ where
         parent: <A::Block as Digestible>::Digest,
         response: &mut oneshot::Sender<Response>,
     ) -> Result<<A::Databases as DatabaseSet<E>>::Unmerkleized, PrepareBatchesError> {
-        let (_, pending, finalized_digest) = self.mode.running();
-        let needs_rebuild = finalized_digest != &parent && !pending.contains(&parent);
+        let RunningState {
+            pending,
+            last_processed_digest,
+            ..
+        } = self.state.state();
+        let needs_rebuild = last_processed_digest != &parent && !pending.contains_key(&parent);
         if needs_rebuild {
             self.rebuild_pending(parent, response).await?;
         }
@@ -789,11 +749,15 @@ where
         &mut self,
         parent: &<A::Block as Digestible>::Digest,
     ) -> Result<<A::Databases as DatabaseSet<E>>::Unmerkleized, PrepareBatchesError> {
-        let (databases, pending, finalized_digest) = self.mode.running();
-        if let Some(merkleized) = pending.get_merkleized(parent) {
+        let RunningState {
+            databases,
+            pending,
+            last_processed_digest,
+        } = self.state.state();
+        if let Some((_, merkleized)) = pending.get(parent) {
             return Ok(<A::Databases as DatabaseSet<E>>::fork_batches(merkleized));
         }
-        if finalized_digest == parent {
+        if last_processed_digest == parent {
             return Ok(databases.new_batches().await);
         }
         Err(PrepareBatchesError::Invalid)
@@ -815,16 +779,20 @@ where
         target: <A::Block as Digestible>::Digest,
         response: &mut oneshot::Sender<Response>,
     ) -> Result<(), PrepareBatchesError> {
-        let (_, pending, finalized_digest) = self.mode.running();
-        let finalized_digest = *finalized_digest;
+        let RunningState {
+            pending,
+            last_processed_digest,
+            ..
+        } = self.state.state();
+        let last_processed_digest = *last_processed_digest;
 
         // Walk back, collecting blocks whose pending state is missing.
         let mut to_replay = Vec::new();
         let mut current = target;
-        while current != finalized_digest {
+        while current != last_processed_digest {
             // If we already have pending state for this digest, we have a safe
             // replay anchor and should not depend on provider availability.
-            if pending.contains(&current) {
+            if pending.contains_key(&current) {
                 break;
             }
 
@@ -886,8 +854,8 @@ where
                 None => return Err(PrepareBatchesError::Cancelled),
             };
 
-            let (_, pending, _) = self.mode.running();
-            pending.insert(digest, round, merkleized);
+            let RunningState { pending, .. } = self.state.state();
+            pending.insert(digest, (round, merkleized));
         }
         Ok(())
     }
@@ -895,13 +863,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Mode, Pending, PendingSyncTip, PrepareBatchesError, Startup, StartupState, StateSyncConfig,
-        Stateful,
-    };
+    use super::{PendingSyncTip, PrepareBatchesError, Startup, State, StateSyncConfig, Stateful};
     use crate::stateful::{
         db::{qmdb::resolver::AttachableResolverSet, DatabaseSet, Merkleized, Unmerkleized},
-        Application, Config as StatefulConfig,
+        Application, Config as StatefulConfig, Proposed,
     };
     use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
     use commonware_consensus::{
@@ -920,7 +885,7 @@ mod tests {
         NZUsize,
     };
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, HashMap},
         convert::Infallible,
         num::NonZeroU64,
         sync::{
@@ -1088,10 +1053,7 @@ mod tests {
             _ancestry: AncestorStream<A, Self::Block>,
             _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
             _input: &mut Self::InputProvider,
-        ) -> Option<(
-            Self::Block,
-            <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized,
-        )> {
+        ) -> Option<Proposed<Self, deterministic::Context>> {
             None
         }
 
@@ -1142,10 +1104,7 @@ mod tests {
             _ancestry: AncestorStream<A, Self::Block>,
             _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
             _input: &mut Self::InputProvider,
-        ) -> Option<(
-            Self::Block,
-            <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized,
-        )> {
+        ) -> Option<Proposed<Self, deterministic::Context>> {
             None
         }
 
@@ -1335,10 +1294,10 @@ mod tests {
                 },
             );
 
-            actor.mode = Mode::Running {
+            actor.state = State::Running {
                 databases: TestDatabases,
-                pending: Pending::new(),
-                finalized_digest: Sha256::hash(b"other-finalized-tip"),
+                pending: HashMap::new(),
+                last_processed_digest: Sha256::hash(b"other-finalized-tip"),
             };
             let (mut response, _rx) = oneshot::channel::<bool>();
             let rebuilt = actor.rebuild_pending(block2.digest(), &mut response).await;
@@ -1380,10 +1339,10 @@ mod tests {
                 },
             );
 
-            actor.mode = Mode::Running {
+            actor.state = State::Running {
                 databases: TestDatabases,
-                pending: Pending::new(),
-                finalized_digest: block1.digest(),
+                pending: HashMap::new(),
+                last_processed_digest: block1.digest(),
             };
             let (mut response, _rx) = oneshot::channel::<bool>();
             let rebuilt = actor.rebuild_pending(block2.digest(), &mut response).await;
@@ -1417,10 +1376,10 @@ mod tests {
                     state_sync: test_state_sync_config::<TestApp>(),
                 },
             );
-            actor.mode = Mode::Running {
+            actor.state = State::Running {
                 databases: TestDatabases,
-                pending: Pending::new(),
-                finalized_digest: block1.digest(),
+                pending: HashMap::new(),
+                last_processed_digest: block1.digest(),
             };
 
             let (mut response, rx) = oneshot::channel::<bool>();
@@ -1463,10 +1422,10 @@ mod tests {
                     state_sync: test_state_sync_config::<SlowReplayApp>(),
                 },
             );
-            actor.mode = Mode::Running {
+            actor.state = State::Running {
                 databases: TestDatabases,
-                pending: Pending::new(),
-                finalized_digest: block1.digest(),
+                pending: HashMap::new(),
+                last_processed_digest: block1.digest(),
             };
 
             let (mut response, rx) = oneshot::channel::<bool>();
@@ -1510,10 +1469,7 @@ mod tests {
             _ancestry: AncestorStream<A, Self::Block>,
             _batches: <Self::Databases as DatabaseSet<deterministic::Context>>::Unmerkleized,
             _input: &mut Self::InputProvider,
-        ) -> Option<(
-            Self::Block,
-            <Self::Databases as DatabaseSet<deterministic::Context>>::Merkleized,
-        )> {
+        ) -> Option<Proposed<Self, deterministic::Context>> {
             None
         }
 
@@ -1570,9 +1526,12 @@ mod tests {
                     state_sync: test_state_sync_config::<SyncTargetApp>(),
                 },
             );
-            if let Mode::Syncing { tip_sender, .. } = &mut actor.mode {
-                *tip_sender = target_tx;
-            }
+            actor.state = State::Syncing {
+                held_verify_responses: Vec::new(),
+                held_acks: Vec::new(),
+                tip_sender: target_tx,
+                sync_resolvers: (),
+            };
 
             actor.handle_tip(block1.height(), block1.digest()).await;
 
@@ -1609,10 +1568,10 @@ mod tests {
                 },
             );
 
-            actor.mode = Mode::Running {
+            actor.state = State::Running {
                 databases: TestDatabases,
-                pending: Pending::new(),
-                finalized_digest: genesis_digest,
+                pending: HashMap::new(),
+                last_processed_digest: genesis_digest,
             };
 
             actor.handle_tip(block1.height(), block1.digest()).await;
@@ -1679,7 +1638,10 @@ mod tests {
                     },
                 },
             );
-            actor.startup = StartupState::Started {
+            actor.state = State::Syncing {
+                held_verify_responses: Vec::new(),
+                held_acks: Vec::new(),
+                tip_sender: mpsc::channel(1).0,
                 sync_resolvers: resolver.clone(),
             };
 
@@ -1712,16 +1674,15 @@ mod tests {
                     state_sync: test_state_sync_config::<TestApp>(),
                 },
             );
-            let mut pending = Pending::new();
+            let mut pending = HashMap::new();
             pending.insert(
                 block2.digest(),
-                Round::new(Epoch::zero(), View::new(2)),
-                TestMerkleized,
+                (Round::new(Epoch::zero(), View::new(2)), TestMerkleized),
             );
-            actor.mode = Mode::Running {
+            actor.state = State::Running {
                 databases: TestDatabases,
                 pending,
-                finalized_digest: block1.digest(),
+                last_processed_digest: block1.digest(),
             };
 
             let (mut response, _rx) = oneshot::channel::<bool>();

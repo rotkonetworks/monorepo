@@ -152,7 +152,7 @@ pub async fn bootstrap<E, A, S, V, R>(
 {
     let marshal_for_sync = marshal.clone();
     let mailbox_for_sync = mailbox.clone();
-    let (databases, sync_height, finalized_digest, floor_height) = {
+    let (databases, sync_height, last_processed_digest, floor_height) = {
         let mut metadata = Metadata::<E, U64, bool>::init(
             config.context.clone().with_label("state_sync_metadata"),
             MetadataConfig {
@@ -241,11 +241,21 @@ pub async fn bootstrap<E, A, S, V, R>(
             "sync complete, setting marshal floor and transitioning to running"
         );
         marshal.set_floor(floor_height).await;
+        let processed_height = marshal
+            .get_processed_height()
+            .await
+            .expect("marshal must respond with processed height after set_floor");
+        assert!(
+            processed_height >= floor_height,
+            "marshal floor must be applied before sync_complete"
+        );
     } else {
         info!(
             sync_height = sync_height.get(),
             "sync complete, transitioning to running"
         );
     }
-    mailbox.sync_complete(databases, finalized_digest).await;
+    mailbox
+        .sync_complete(databases, last_processed_digest)
+        .await;
 }

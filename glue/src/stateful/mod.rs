@@ -48,10 +48,14 @@ pub mod db;
 #[cfg(test)]
 mod tests;
 
-type ProposedOutput<A, E> = (
-    <A as Application<E>>::Block,
-    <<A as Application<E>>::Databases as DatabaseSet<E>>::Merkleized,
-);
+/// The output of a successful [`Application::propose`] call.
+pub struct Proposed<A: Application<E>, E: Rng + Spawner + Metrics + Clock> {
+    /// The block built by the application.
+    pub block: A::Block,
+
+    /// The merkleized database batches produced during execution.
+    pub merkleized: <A::Databases as DatabaseSet<E>>::Merkleized,
+}
 
 /// A stateful application whose storage is managed by a [`DatabaseSet`].
 ///
@@ -92,6 +96,14 @@ where
     /// transitions.
     type InputProvider: Clone + Send;
 
+    /// Extract per-database sync targets from a finalized block.
+    ///
+    /// Called by the wrapper when a [`Update::Tip`](commonware_consensus::marshal::Update::Tip)
+    /// is received during state sync. The returned targets are forwarded to
+    /// the background sync orchestrator so the sync engines can track the
+    /// latest finalized state root and range.
+    fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets;
+
     /// Block used to initialize the consensus engine in the first epoch.
     fn genesis(&mut self) -> impl Future<Output = Self::Block> + Send;
 
@@ -108,7 +120,7 @@ where
         ancestry: AncestorStream<A, Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
-    ) -> impl Future<Output = Option<ProposedOutput<Self, E>>> + Send;
+    ) -> impl Future<Output = Option<Proposed<Self, E>>> + Send;
 
     /// Verify a block received from a peer, relative to its ancestry.
     ///
@@ -148,12 +160,4 @@ where
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> impl Future<Output = <Self::Databases as DatabaseSet<E>>::Merkleized> + Send;
-
-    /// Extract per-database sync targets from a finalized block.
-    ///
-    /// Called by the wrapper when a [`Update::Tip`](commonware_consensus::marshal::Update::Tip)
-    /// is received during state sync. The returned targets are forwarded to
-    /// the background sync orchestrator so the sync engines can track the
-    /// latest finalized state root and range.
-    fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets;
 }

@@ -25,7 +25,7 @@
 mod mailbox;
 pub use mailbox::Mailbox;
 
-mod bootstrap;
-
 mod core;
 pub use core::{Config, Startup, StateSyncConfig, Stateful};
+
+mod bootstrap;

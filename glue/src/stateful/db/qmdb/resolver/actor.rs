@@ -1,26 +1,33 @@
 //! Resolver service actor for QMDB sync over P2P.
 
-use super::{mailbox, Mailbox, State, SyncableDb};
-use bytes::Bytes;
+use super::{handler, mailbox, Mailbox, State, SyncableDb};
+use commonware_codec::{Codec, DecodeExt, Encode};
 use commonware_cryptography::PublicKey;
 use commonware_macros::select_loop;
 use commonware_p2p::{Blocker, Provider, Receiver, Sender};
-use commonware_resolver::{self as resolver, p2p::Producer};
+use commonware_resolver::{p2p, Resolver as _};
 use commonware_runtime::{
     spawn_cell,
     telemetry::metrics::status::{self, CounterExt},
     BufferPooler, Clock, ContextCell, Handle, Metrics, Spawner,
 };
-use commonware_utils::channel::{
-    fallible::{AsyncFallibleExt, OneshotExt},
-    mpsc, oneshot,
+use commonware_storage::qmdb::sync::resolver::FetchResult;
+use commonware_utils::{
+    channel::{fallible::OneshotExt, mpsc, oneshot},
+    sync::AsyncRwLock,
 };
+use futures::future::{self, Either};
 use rand::Rng;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::info;
 
-type SyncMailbox<E, P, DB> =
-    Mailbox<P, <DB as SyncableDb<E>>::SyncOp, <DB as SyncableDb<E>>::SyncDigest, DB>;
+type SyncMailbox<E, DB> =
+    Mailbox<<DB as SyncableDb<E>>::SyncOp, <DB as SyncableDb<E>>::SyncDigest, DB>;
+type Pending<Op, D> = oneshot::Sender<Result<FetchResult<Op, D>, mailbox::ResponseDropped>>;
+type PendingSubs<E, DB> = HashMap<
+    handler::Request,
+    Vec<Pending<<DB as SyncableDb<E>>::SyncOp, <DB as SyncableDb<E>>::SyncDigest>>,
+>;
 
 /// Configuration for [`Actor`].
 pub struct Config<P, D, B, DB>
@@ -36,7 +43,7 @@ where
     pub blocker: B,
 
     /// Local database used to serve incoming requests when available.
-    pub database: Option<Arc<commonware_utils::sync::AsyncRwLock<DB>>>,
+    pub database: Option<Arc<AsyncRwLock<DB>>>,
 
     /// Maximum size of resolver mailbox backlogs.
     pub mailbox_size: usize,
@@ -60,127 +67,35 @@ where
     pub priority_responses: bool,
 }
 
-enum HandlerMessage {
-    Deliver {
-        key: mailbox::Request,
-        value: Bytes,
-        response: oneshot::Sender<bool>,
-    },
-    Failed {
-        key: mailbox::Request,
-    },
-    Produce {
-        key: mailbox::Request,
-        response: oneshot::Sender<Bytes>,
-    },
-}
-
-#[derive(Clone)]
-struct Handler {
-    sender: mpsc::Sender<HandlerMessage>,
-}
-
-impl Handler {
-    const fn new(sender: mpsc::Sender<HandlerMessage>) -> Self {
-        Self { sender }
-    }
-}
-
-impl resolver::Consumer for Handler {
-    type Key = mailbox::Request;
-    type Value = Bytes;
-    type Failure = ();
-
-    async fn deliver(&mut self, key: Self::Key, value: Self::Value) -> bool {
-        self.sender
-            .request_or(
-                |response| HandlerMessage::Deliver {
-                    key,
-                    value,
-                    response,
-                },
-                false,
-            )
-            .await
-    }
-
-    async fn failed(&mut self, key: Self::Key, _: Self::Failure) {
-        self.sender.send_lossy(HandlerMessage::Failed { key }).await;
-    }
-}
-
-impl Producer for Handler {
-    type Key = mailbox::Request;
-
-    async fn produce(&mut self, key: Self::Key) -> oneshot::Receiver<Bytes> {
-        let (response, receiver) = oneshot::channel();
-        self.sender
-            .send_lossy(HandlerMessage::Produce { key, response })
-            .await;
-        receiver
-    }
-}
-
 /// Runs a QMDB sync resolver service over `commonware_resolver::p2p::Engine`.
-pub struct Actor<E, P, D, B, DB, NetS, NetR>
+pub struct Actor<E, P, D, B, DB>
 where
     E: BufferPooler + Clock + Spawner + Rng + Metrics,
     P: PublicKey,
     D: Provider<PublicKey = P>,
     B: Blocker<PublicKey = P>,
     DB: SyncableDb<E>,
-    DB::SyncOp: commonware_codec::Read<Cfg = ()>
-        + commonware_codec::Write
-        + commonware_codec::EncodeSize
-        + Send
-        + Sync
-        + Clone
-        + 'static,
-    NetS: Sender<PublicKey = P>,
-    NetR: Receiver<PublicKey = P>,
+    DB::SyncOp: Codec<Cfg = ()> + Send + Sync + Clone + 'static,
 {
     context: ContextCell<E>,
-    peer_provider: D,
-    blocker: B,
-    mailbox_size: usize,
-    me: Option<P>,
-    initial: Duration,
-    timeout: Duration,
-    fetch_retry_timeout: Duration,
-    priority_requests: bool,
-    priority_responses: bool,
-    handler_tx: mpsc::Sender<HandlerMessage>,
-    handler_rx: mpsc::Receiver<HandlerMessage>,
-    attach_sender: mpsc::Sender<mailbox::AttachMessage<DB>>,
-    attach_rx: mpsc::Receiver<mailbox::AttachMessage<DB>>,
-    _network: std::marker::PhantomData<(NetS, NetR)>,
+    config: Config<P, D, B, DB>,
+    mailbox_rx: mpsc::Receiver<mailbox::Message<DB, DB::SyncOp, DB::SyncDigest>>,
     state: State<DB>,
     serve_requests: status::Counter,
-    pending: mailbox::PendingMap,
+    pending: PendingSubs<E, DB>,
 }
 
-impl<E, P, D, B, DB, NetS, NetR> Actor<E, P, D, B, DB, NetS, NetR>
+impl<E, P, D, B, DB> Actor<E, P, D, B, DB>
 where
     E: BufferPooler + Clock + Spawner + Rng + Metrics,
     P: PublicKey,
     D: Provider<PublicKey = P>,
     B: Blocker<PublicKey = P>,
     DB: SyncableDb<E>,
-    DB::SyncOp: commonware_codec::Read<Cfg = ()>
-        + commonware_codec::Write
-        + commonware_codec::EncodeSize
-        + Send
-        + Sync
-        + Clone
-        + 'static,
-    NetS: Sender<PublicKey = P>,
-    NetR: Receiver<PublicKey = P>,
+    DB::SyncOp: Codec<Cfg = ()> + Send + Sync + Clone + 'static,
 {
-    /// Create a new resolver actor.
-    pub fn new(context: E, cfg: Config<P, D, B, DB>) -> Self {
-        let pending = mailbox::pending_map();
-        let (handler_tx, handler_rx) = mpsc::channel(cfg.mailbox_size);
-        let (attach_sender, attach_rx) = mpsc::channel(cfg.mailbox_size);
+    /// Create a new resolver actor and mailbox.
+    pub fn new(context: E, mut cfg: Config<P, D, B, DB>) -> (Self, SyncMailbox<E, DB>) {
         let serve_requests = status::Counter::default();
         context.register(
             "serve_requests",
@@ -188,154 +103,200 @@ where
             serve_requests.clone(),
         );
 
-        Self {
+        let state = cfg.database.take().map_or(State::NoDb, State::HasDb);
+
+        let (mailbox_tx, mailbox_rx) = mpsc::channel(cfg.mailbox_size);
+        let mailbox = Mailbox::new(mailbox_tx);
+
+        let actor = Self {
             context: ContextCell::new(context),
-            peer_provider: cfg.peer_provider,
-            blocker: cfg.blocker,
-            mailbox_size: cfg.mailbox_size,
-            me: cfg.me,
-            initial: cfg.initial,
-            timeout: cfg.timeout,
-            fetch_retry_timeout: cfg.fetch_retry_timeout,
-            priority_requests: cfg.priority_requests,
-            priority_responses: cfg.priority_responses,
-            handler_tx,
-            handler_rx,
-            attach_sender,
-            attach_rx,
-            _network: std::marker::PhantomData,
-            state: cfg
-                .database
-                .map_or_else(|| State::NoDb, |database| State::HasDb(database)),
+            config: cfg,
+            mailbox_rx,
+            state,
             serve_requests,
-            pending,
-        }
+            pending: HashMap::new(),
+        };
+        (actor, mailbox)
     }
 
-    /// Start the resolver service and return the sync mailbox.
-    pub fn start(mut self, network: (NetS, NetR)) -> (Handle<()>, SyncMailbox<E, P, DB>) {
-        let handler = Handler::new(self.handler_tx.clone());
-        let (engine, resolver_mailbox) = commonware_resolver::p2p::Engine::new(
-            self.context.clone().into_present().with_label("resolver"),
-            commonware_resolver::p2p::Config {
-                peer_provider: self.peer_provider.clone(),
-                blocker: self.blocker.clone(),
-                consumer: handler.clone(),
-                producer: handler,
-                mailbox_size: self.mailbox_size,
-                me: self.me.clone(),
-                initial: self.initial,
-                timeout: self.timeout,
-                fetch_retry_timeout: self.fetch_retry_timeout,
-                priority_requests: self.priority_requests,
-                priority_responses: self.priority_responses,
-            },
-        );
-        let mailbox = Mailbox::new(
-            resolver_mailbox,
-            self.attach_sender.clone(),
-            self.pending.clone(),
-        );
-        let handle = spawn_cell!(self.context, self.run(network, engine).await);
-        (handle, mailbox)
+    /// Start the resolver service.
+    pub fn start(
+        mut self,
+        net: (impl Sender<PublicKey = P>, impl Receiver<PublicKey = P>),
+    ) -> Handle<()> {
+        spawn_cell!(self.context, self.run(net).await)
     }
 
+    /// Main event loop: multiplexes mailbox messages and engine callbacks.
     async fn run(
         mut self,
-        network: (NetS, NetR),
-        engine: commonware_resolver::p2p::Engine<
-            E,
-            P,
-            D,
-            B,
-            mailbox::Request,
-            Handler,
-            Handler,
-            NetS,
-            NetR,
-        >,
+        (sender, receiver): (impl Sender<PublicKey = P>, impl Receiver<PublicKey = P>),
     ) {
-        let mut resolver_task = engine.start(network);
+        let (handler_tx, mut handler_rx) = mpsc::channel(self.config.mailbox_size);
+        let handler = handler::CallbackHandler::new(handler_tx);
+        let (engine, mut resolver_mailbox) = p2p::Engine::new(
+            self.context.clone().into_present().with_label("resolver"),
+            p2p::Config {
+                peer_provider: self.config.peer_provider.clone(),
+                blocker: self.config.blocker.clone(),
+                consumer: handler.clone(),
+                producer: handler,
+                mailbox_size: self.config.mailbox_size,
+                me: self.config.me.clone(),
+                initial: self.config.initial,
+                timeout: self.config.timeout,
+                fetch_retry_timeout: self.config.fetch_retry_timeout,
+                priority_requests: self.config.priority_requests,
+                priority_responses: self.config.priority_responses,
+            },
+        );
+        let mut resolver_task = engine.start((sender, receiver));
 
         select_loop! {
             self.context,
+            on_start => {
+                let mailbox_message = if !self.mailbox_rx.is_closed() {
+                    Either::Left(self.mailbox_rx.recv())
+                } else {
+                    Either::Right(future::pending())
+                };
+            },
             on_stopped => {
                 return;
             },
             _ = &mut resolver_task => {
                 return;
             },
-            Some(message) = self.attach_rx.recv() else {
-                return;
-            } => {
-                self.handle_attach_message(message);
+            Some(message) = mailbox_message else continue => {
+                if let Some(request) = self.handle_mailbox_message(message) {
+                    resolver_mailbox.fetch(request).await;
+                }
             },
-            Some(message) = self.handler_rx.recv() else {
+            Some(message) = handler_rx.recv() else {
                 return;
             } => {
-                self.handle_message(message).await;
+                match message {
+                    handler::EngineMessage::Deliver { key, value, response } => {
+                        self.handle_deliver(key, value, response).await;
+                    }
+                    handler::EngineMessage::Failed { key } => {
+                        self.pending.remove(&key);
+                    }
+                    handler::EngineMessage::Produce { key, response } => {
+                        self.handle_produce(key, response).await;
+                    }
+                }
             },
         }
     }
 
-    fn handle_attach_message(&mut self, message: mailbox::AttachMessage<DB>) {
+    /// Process a mailbox message. Returns a request to fetch if a new key was registered.
+    fn handle_mailbox_message(
+        &mut self,
+        message: mailbox::Message<DB, DB::SyncOp, DB::SyncDigest>,
+    ) -> Option<handler::Request> {
         match message {
-            mailbox::AttachMessage::AttachDatabase { db } => {
+            mailbox::Message::AttachDatabase(db) => {
                 let replacing_existing = matches!(self.state, State::HasDb(_));
                 info!(replacing_existing, "attached resolver database");
                 self.state = State::HasDb(db);
+                None
+            }
+            mailbox::Message::GetOperations { request, response } => {
+                if let Some(subscribers) = self.pending.get_mut(&request) {
+                    subscribers.push(response);
+                    return None;
+                }
+                self.pending.insert(request.clone(), vec![response]);
+                Some(request)
             }
         }
     }
 
-    async fn handle_message(&mut self, message: HandlerMessage) {
-        match message {
-            HandlerMessage::Deliver {
-                key,
-                value,
-                response,
-            } => {
-                let pending = { self.pending.lock().remove(&key) };
-                let valid = if let Some(pending) = pending {
-                    if pending.response_tx.send(value).is_err() {
-                        // TODO: Just use a lossy send? Can't block ig.
-                        true
-                    } else {
-                        pending.success_rx.await.unwrap_or(false)
-                    }
-                } else {
-                    true
-                };
-                response.send_lossy(valid);
+    /// Decode a peer's response, fan it out to pending subscribers, and aggregate approvals.
+    async fn handle_deliver(
+        &mut self,
+        key: handler::Request,
+        value: bytes::Bytes,
+        response: oneshot::Sender<bool>,
+    ) {
+        let Some(subscribers) = self.pending.remove(&key) else {
+            response.send_lossy(true);
+            return;
+        };
+        let decoded = match handler::Response::<DB::SyncOp, DB::SyncDigest>::decode(value) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                self.pending.insert(key, subscribers);
+                response.send_lossy(false);
+                return;
             }
-            HandlerMessage::Failed { key } => {
-                self.pending.lock().remove(&key);
-            }
-            HandlerMessage::Produce { key, response } => {
-                let State::HasDb(database) = &self.state else {
-                    self.serve_requests.inc(status::Status::Dropped);
-                    return;
-                };
-                let result = DB::get_operations(
-                    database,
-                    key.op_count,
-                    key.start_loc,
-                    key.max_ops,
-                    key.include_pinned_nodes,
-                )
-                .await;
+        };
 
-                match result {
-                    Ok(fetch) => {
-                        response.send_lossy(mailbox::encode_fetch_result(fetch));
-                        self.serve_requests.inc(status::Status::Success);
-                    }
-                    Err(_) => {
-                        self.serve_requests.inc(status::Status::Failure);
-                    }
-                }
+        let mut valid = true;
+        let mut approvals = Vec::new();
+        for subscriber in subscribers {
+            let (success_tx, success_rx) = oneshot::channel();
+            if subscriber
+                .send(Ok(FetchResult {
+                    proof: decoded.proof.clone(),
+                    operations: decoded.operations.clone(),
+                    success_tx,
+                    pinned_nodes: decoded.pinned_nodes.clone(),
+                }))
+                .is_err()
+            {
+                continue;
+            }
+            approvals.push(success_rx);
+        }
+
+        if approvals.is_empty() {
+            response.send_lossy(true);
+            return;
+        }
+
+        for approval in approvals {
+            if let Ok(approved) = approval.await {
+                valid &= approved;
             }
         }
+        response.send_lossy(valid);
+    }
+
+    /// Serve a peer's request by querying the local database.
+    async fn handle_produce(
+        &mut self,
+        key: handler::Request,
+        response: oneshot::Sender<bytes::Bytes>,
+    ) {
+        let State::HasDb(database) = &self.state else {
+            self.serve_requests.inc(status::Status::Dropped);
+            return;
+        };
+        let result = DB::get_operations(
+            database,
+            key.op_count,
+            key.start_loc,
+            key.max_ops,
+            key.include_pinned_nodes,
+        )
+        .await;
+
+        let Ok(fetch) = result else {
+            self.serve_requests.inc(status::Status::Failure);
+            return;
+        };
+
+        response.send_lossy(
+            handler::Response {
+                proof: fetch.proof,
+                operations: fetch.operations,
+                pinned_nodes: fetch.pinned_nodes,
+            }
+            .encode(),
+        );
+        self.serve_requests.inc(status::Status::Success);
     }
 }
 
@@ -347,7 +308,7 @@ mod tests {
     use commonware_p2p::Provider;
     use commonware_runtime::{buffer::paged::CacheRef, deterministic, BufferPooler, Runner as _};
     use commonware_storage::{
-        mmr::Location,
+        mmr::{Location, Proof},
         qmdb::any::{unordered::fixed, FixedConfig},
         translator::TwoCap,
     };
@@ -382,16 +343,44 @@ mod tests {
     }
 
     type TestDb = fixed::Db<deterministic::Context, sha256::Digest, sha256::Digest, Sha256, TwoCap>;
+    type TestOp = <TestDb as SyncableDb<deterministic::Context>>::SyncOp;
 
-    type TestActor = Actor<
-        deterministic::Context,
-        ed25519::PublicKey,
-        DummyProvider,
-        DummyBlocker,
-        TestDb,
-        commonware_p2p::simulated::Sender<ed25519::PublicKey, deterministic::Context>,
-        commonware_p2p::simulated::Receiver<ed25519::PublicKey>,
-    >;
+    type TestActor =
+        Actor<deterministic::Context, ed25519::PublicKey, DummyProvider, DummyBlocker, TestDb>;
+
+    fn test_config(
+        database: Option<Arc<AsyncRwLock<TestDb>>>,
+    ) -> Config<ed25519::PublicKey, DummyProvider, DummyBlocker, TestDb> {
+        Config {
+            peer_provider: DummyProvider,
+            blocker: DummyBlocker,
+            database,
+            mailbox_size: 16,
+            me: None,
+            initial: Duration::from_millis(10),
+            timeout: Duration::from_millis(10),
+            fetch_retry_timeout: Duration::from_millis(10),
+            priority_requests: false,
+            priority_responses: false,
+        }
+    }
+
+    fn test_request_at(op_count: Location) -> handler::Request {
+        handler::Request {
+            op_count,
+            start_loc: Location::new(0),
+            max_ops: NonZeroU64::new(1).unwrap(),
+            include_pinned_nodes: false,
+        }
+    }
+
+    type TestPending = Pending<TestOp, sha256::Digest>;
+    type TestPendingResult =
+        oneshot::Receiver<Result<FetchResult<TestOp, sha256::Digest>, mailbox::ResponseDropped>>;
+
+    fn test_subscriber() -> (TestPending, TestPendingResult) {
+        oneshot::channel()
+    }
 
     fn db_config(suffix: &str, pooler: &impl BufferPooler) -> FixedConfig<TwoCap> {
         FixedConfig {
@@ -415,47 +404,26 @@ mod tests {
         Arc::new(AsyncRwLock::new(db))
     }
 
-    async fn test_request(db: &Arc<AsyncRwLock<TestDb>>) -> mailbox::Request {
-        let op_count = db.read().await.bounds().await.end;
-        mailbox::Request {
-            op_count,
-            start_loc: Location::new(0),
-            max_ops: NonZeroU64::new(1).unwrap(),
-            include_pinned_nodes: false,
+    fn encoded_fetch_payload() -> Bytes {
+        handler::Response::<TestOp, sha256::Digest> {
+            proof: Proof {
+                leaves: Location::new(0),
+                digests: Vec::new(),
+            },
+            operations: Vec::new(),
+            pinned_nodes: None,
         }
+        .encode()
     }
 
     #[test]
     fn produce_denied_before_attach() {
         deterministic::Runner::default().start(|context| async move {
-            let mut actor: TestActor = Actor::new(
-                context.clone(),
-                Config {
-                    peer_provider: DummyProvider,
-                    blocker: DummyBlocker,
-                    database: None,
-                    mailbox_size: 16,
-                    me: None,
-                    initial: Duration::from_millis(10),
-                    timeout: Duration::from_millis(10),
-                    fetch_retry_timeout: Duration::from_millis(10),
-                    priority_requests: false,
-                    priority_responses: false,
-                },
-            );
+            let (mut actor, _mailbox) = TestActor::new(context.clone(), test_config(None));
 
             let (response_tx, response_rx) = oneshot::channel();
-            let request = mailbox::Request {
-                op_count: Location::new(1),
-                start_loc: Location::new(0),
-                max_ops: NonZeroU64::new(1).unwrap(),
-                include_pinned_nodes: false,
-            };
             actor
-                .handle_message(HandlerMessage::Produce {
-                    key: request,
-                    response: response_tx,
-                })
+                .handle_produce(test_request_at(Location::new(1)), response_tx)
                 .await;
             assert!(response_rx.await.is_err());
         });
@@ -464,31 +432,14 @@ mod tests {
     #[test]
     fn same_request_served_after_attach() {
         deterministic::Runner::default().start(|context| async move {
-            let mut actor: TestActor = Actor::new(
-                context.clone(),
-                Config {
-                    peer_provider: DummyProvider,
-                    blocker: DummyBlocker,
-                    database: None,
-                    mailbox_size: 16,
-                    me: None,
-                    initial: Duration::from_millis(10),
-                    timeout: Duration::from_millis(10),
-                    fetch_retry_timeout: Duration::from_millis(10),
-                    priority_requests: false,
-                    priority_responses: false,
-                },
-            );
+            let (mut actor, _mailbox) = TestActor::new(context.clone(), test_config(None));
             let db = init_db(context.clone(), "resolver-after-attach").await;
-            let request = test_request(&db).await;
-            actor.handle_attach_message(mailbox::AttachMessage::AttachDatabase { db });
+            let op_count = db.read().await.bounds().await.end;
+            actor.handle_mailbox_message(mailbox::Message::AttachDatabase(db));
 
             let (response_tx, response_rx) = oneshot::channel();
             actor
-                .handle_message(HandlerMessage::Produce {
-                    key: request,
-                    response: response_tx,
-                })
+                .handle_produce(test_request_at(op_count), response_tx)
                 .await;
 
             let payload = response_rx
@@ -501,48 +452,75 @@ mod tests {
     #[test]
     fn deliver_with_dropped_response_receiver_is_treated_as_valid() {
         deterministic::Runner::default().start(|context| async move {
-            let mut actor: TestActor = Actor::new(
-                context,
-                Config {
-                    peer_provider: DummyProvider,
-                    blocker: DummyBlocker,
-                    database: None,
-                    mailbox_size: 16,
-                    me: None,
-                    initial: Duration::from_millis(10),
-                    timeout: Duration::from_millis(10),
-                    fetch_retry_timeout: Duration::from_millis(10),
-                    priority_requests: false,
-                    priority_responses: false,
-                },
-            );
-            let request = mailbox::Request {
-                op_count: Location::new(1),
-                start_loc: Location::new(0),
-                max_ops: NonZeroU64::new(1).unwrap(),
-                include_pinned_nodes: false,
-            };
+            let (mut actor, _mailbox) = TestActor::new(context, test_config(None));
+            let request = test_request_at(Location::new(1));
 
-            let (response_tx, response_rx) = oneshot::channel();
-            drop(response_rx);
-            let (success_tx, success_rx) = oneshot::channel();
-            actor.pending.lock().insert(
-                request.clone(),
-                mailbox::Pending {
-                    response_tx,
-                    success_rx,
-                },
-            );
-            drop(success_tx);
+            let (subscriber_tx, subscriber_rx) = test_subscriber();
+            drop(subscriber_rx);
+            actor.pending.insert(request.clone(), vec![subscriber_tx]);
 
             let (ack_tx, ack_rx) = oneshot::channel();
             actor
-                .handle_message(HandlerMessage::Deliver {
-                    key: request,
-                    value: Bytes::from_static(b"payload"),
-                    response: ack_tx,
-                })
+                .handle_deliver(request, encoded_fetch_payload(), ack_tx)
                 .await;
+
+            assert!(ack_rx.await.unwrap());
+        });
+    }
+
+    #[test]
+    fn deliver_with_multiple_subscribers_combines_acknowledgements() {
+        deterministic::Runner::default().start(|context| async move {
+            let (mut actor, _mailbox) = TestActor::new(context, test_config(None));
+            let request = test_request_at(Location::new(1));
+
+            let (sub1_tx, sub1_rx) = test_subscriber();
+            let (sub2_tx, sub2_rx) = test_subscriber();
+            actor
+                .pending
+                .insert(request.clone(), vec![sub1_tx, sub2_tx]);
+
+            let (ack_tx, ack_rx) = oneshot::channel();
+            futures::join!(
+                actor.handle_deliver(request, encoded_fetch_payload(), ack_tx),
+                async {
+                    let fetch = sub1_rx.await.unwrap().unwrap();
+                    fetch.success_tx.send(true).unwrap();
+                },
+                async {
+                    let fetch = sub2_rx.await.unwrap().unwrap();
+                    fetch.success_tx.send(false).unwrap();
+                }
+            );
+
+            assert!(!ack_rx.await.unwrap());
+        });
+    }
+
+    #[test]
+    fn deliver_ignores_dropped_subscriber_approval() {
+        deterministic::Runner::default().start(|context| async move {
+            let (mut actor, _mailbox) = TestActor::new(context, test_config(None));
+            let request = test_request_at(Location::new(1));
+
+            let (sub1_tx, sub1_rx) = test_subscriber();
+            let (sub2_tx, sub2_rx) = test_subscriber();
+            actor
+                .pending
+                .insert(request.clone(), vec![sub1_tx, sub2_tx]);
+
+            let (ack_tx, ack_rx) = oneshot::channel();
+            futures::join!(
+                actor.handle_deliver(request, encoded_fetch_payload(), ack_tx),
+                async {
+                    let fetch = sub1_rx.await.unwrap().unwrap();
+                    drop(fetch);
+                },
+                async {
+                    let fetch = sub2_rx.await.unwrap().unwrap();
+                    fetch.success_tx.send(true).unwrap();
+                }
+            );
 
             assert!(ack_rx.await.unwrap());
         });
@@ -551,51 +529,17 @@ mod tests {
     #[test]
     fn failed_then_deliver_clears_pending_and_allows_retry() {
         deterministic::Runner::default().start(|context| async move {
-            let mut actor: TestActor = Actor::new(
-                context,
-                Config {
-                    peer_provider: DummyProvider,
-                    blocker: DummyBlocker,
-                    database: None,
-                    mailbox_size: 16,
-                    me: None,
-                    initial: Duration::from_millis(10),
-                    timeout: Duration::from_millis(10),
-                    fetch_retry_timeout: Duration::from_millis(10),
-                    priority_requests: false,
-                    priority_responses: false,
-                },
-            );
-            let request = mailbox::Request {
-                op_count: Location::new(1),
-                start_loc: Location::new(0),
-                max_ops: NonZeroU64::new(1).unwrap(),
-                include_pinned_nodes: false,
-            };
+            let (mut actor, _mailbox) = TestActor::new(context, test_config(None));
+            let request = test_request_at(Location::new(1));
 
-            let (response_tx, _response_rx) = oneshot::channel();
-            let (_success_tx, success_rx) = oneshot::channel();
-            actor.pending.lock().insert(
-                request.clone(),
-                mailbox::Pending {
-                    response_tx,
-                    success_rx,
-                },
-            );
-            actor
-                .handle_message(HandlerMessage::Failed {
-                    key: request.clone(),
-                })
-                .await;
-            assert!(actor.pending.lock().get(&request).is_none());
+            let (subscriber_tx, _subscriber_rx) = test_subscriber();
+            actor.pending.insert(request.clone(), vec![subscriber_tx]);
+            actor.pending.remove(&request);
+            assert!(!actor.pending.contains_key(&request));
 
             let (ack_tx, ack_rx) = oneshot::channel();
             actor
-                .handle_message(HandlerMessage::Deliver {
-                    key: request,
-                    value: Bytes::from_static(b"late-response"),
-                    response: ack_tx,
-                })
+                .handle_deliver(request, Bytes::from_static(b"late-response"), ack_tx)
                 .await;
             assert!(ack_rx.await.unwrap());
         });

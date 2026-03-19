@@ -8,15 +8,18 @@
 //! - [`SyncableDb`]: a trait for [`ManagedDb`]
 //!   implementations that can serve sync operation requests.
 
-mod actor;
-mod mailbox;
-
 use crate::stateful::db::ManagedDb;
-pub use actor::{Actor, Config};
 use commonware_storage::qmdb::sync::resolver::{FetchResult, Resolver as SyncResolver};
 use commonware_utils::sync::AsyncRwLock;
-pub use mailbox::{Error, Mailbox, Request};
 use std::{future::Future, num::NonZeroU64, sync::Arc};
+
+mod actor;
+pub use actor::{Actor, Config};
+
+mod mailbox;
+pub use mailbox::{Mailbox, ResponseDropped};
+
+mod handler;
 
 /// Runtime serving state for a resolver actor.
 pub enum State<DB> {
@@ -141,9 +144,8 @@ where
     }
 }
 
-impl<P, Op, D, DB> AttachableResolver<DB> for Mailbox<P, Op, D, DB>
+impl<Op, D, DB> AttachableResolver<DB> for Mailbox<Op, D, DB>
 where
-    P: commonware_cryptography::PublicKey,
     Op: commonware_codec::Read<Cfg = ()> + Send + Sync + Clone + 'static,
     D: commonware_cryptography::Digest,
     DB: Send + Sync + 'static,

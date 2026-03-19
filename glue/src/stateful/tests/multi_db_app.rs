@@ -1,7 +1,7 @@
+use super::common::*;
 use crate::{
     simulate::{
         engine::{EngineDefinition, InitContext},
-        processed::ProcessedHeight,
         reporter::MonitorReporter,
     },
     stateful::{
@@ -9,7 +9,8 @@ use crate::{
             qmdb::resolver as qmdb_resolver, DatabaseSet, Merkleized as _, SyncEngineConfig,
             Unmerkleized as _,
         },
-        Application, Config as StatefulConfig, Startup, StateSyncConfig, Stateful as StatefulActor,
+        Application, Config as StatefulConfig, Proposed, Startup, StateSyncConfig,
+        Stateful as StatefulActor,
     },
 };
 use commonware_broadcast::buffered;
@@ -21,7 +22,6 @@ use commonware_consensus::{
         core::Actor as MarshalActor,
         resolver::p2p as marshal_resolver,
         standard::{Deferred, Standard},
-        Identifier as MarshalIdentifier,
     },
     simplex::{
         self,
@@ -34,9 +34,10 @@ use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable,
 };
 use commonware_cryptography::{
-    certificate::{mocks::Fixture, ConstantProvider, Scheme as _},
+    certificate::{mocks::Fixture, ConstantProvider},
     ed25519, sha256, Digest as _, Digestible, Hasher, Sha256, Signer as _,
 };
+use commonware_p2p::utils::mux::Muxer;
 use commonware_parallel::Sequential;
 use commonware_runtime::{
     buffer::paged::CacheRef, Buf, BufMut, Clock, Handle, Metrics, Quota, Spawner, Storage,
@@ -52,90 +53,32 @@ use commonware_storage::{
 };
 use commonware_utils::{
     sync::{AsyncRwLock, Mutex},
-    test_rng, NZUsize, NZU16, NZU64,
+    test_rng, NZUsize, NZU64,
 };
 use rand::Rng;
-use std::{
-    collections::{BTreeMap, HashMap},
-    num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, ops::Range, sync::Arc, time::Duration};
 
-const EPOCH_LENGTH: NonZeroU64 = NZU64!(u64::MAX);
-const NAMESPACE: &[u8] = b"stateful_e2e_test";
-const PAGE_SIZE: NonZeroU16 = NZU16!(1024);
-const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(10);
-const IO_BUFFER_SIZE: NonZeroUsize = NZUsize!(2048);
-const TEST_QUOTA: Quota = Quota::per_second(NonZeroU32::MAX);
-
-/// The QMDB database type used by the e2e tests.
+/// The QMDB database type used by the multi-db e2e tests.
 type Qmdb<E> = fixed::Db<E, sha256::Digest, sha256::Digest, Sha256, TwoCap>;
 
-pub(crate) type MockDatabaseSet<E> = Arc<AsyncRwLock<Qmdb<E>>>;
-type MarshalMailbox = marshal::core::Mailbox<MockScheme<ed25519::PublicKey>, Standard<Block>>;
+/// A single QMDB database behind a lock.
+type SingleDb<E> = Arc<AsyncRwLock<Qmdb<E>>>;
 
-#[derive(Clone)]
-pub(crate) struct MockValidatorState {
-    marshal: MarshalMailbox,
-    startup_sync_height: Option<u64>,
-}
+/// Two QMDB databases as a tuple.
+pub(crate) type MultiDatabaseSet<E> = (SingleDb<E>, SingleDb<E>);
 
-impl MockValidatorState {
-    pub(crate) async fn digest_at_height(&self, height: u64) -> Option<sha256::Digest> {
-        self.marshal
-            .get_info(marshal::Identifier::Height(Height::new(height)))
-            .await
-            .map(|(_, digest)| digest)
-    }
+type MarshalMailbox = MarshalMailboxOf<Standard<Block>>;
 
-    pub(crate) const fn startup_sync_height(&self) -> Option<u64> {
-        self.startup_sync_height
-    }
-}
-
-impl ProcessedHeight for MockValidatorState {
-    async fn processed_height(&self) -> u64 {
-        self.marshal
-            .get_processed_height()
-            .await
-            .map_or(0, |height| height.get())
-    }
-}
-
-/// Deterministic key for the block counter.
-fn counter_key() -> sha256::Digest {
-    Sha256::hash(b"counter")
-}
-
-/// Deterministic key for a height marker.
-fn height_key(height: u64) -> sha256::Digest {
-    Sha256::hash(&height.to_be_bytes())
-}
-
-/// Encode a u64 as a digest (zero-padded).
-fn u64_to_digest(v: u64) -> sha256::Digest {
-    let mut bytes = [0u8; 32];
-    bytes[..8].copy_from_slice(&v.to_be_bytes());
-    sha256::Digest::from(bytes)
-}
-
-/// Decode a u64 from a digest (first 8 bytes).
-fn digest_to_u64(d: &sha256::Digest) -> u64 {
-    let bytes: &[u8] = d.as_ref();
-    u64::from_be_bytes(bytes[..8].try_into().unwrap())
-}
-
-/// A block carrying key-value mutations with embedded consensus context.
+/// A block carrying state from two QMDB databases.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Block {
     context: Context<sha256::Digest, ed25519::PublicKey>,
     parent: sha256::Digest,
     height: Height,
-    digest: sha256::Digest,
-    state_root: sha256::Digest,
-    inactivity_floor: Location,
-    op_count: Location,
+    root_a: sha256::Digest,
+    range_a: Range<Location>,
+    root_b: sha256::Digest,
+    range_b: Range<Location>,
 }
 
 impl Write for Block {
@@ -143,10 +86,10 @@ impl Write for Block {
         self.context.write(buf);
         self.parent.write(buf);
         self.height.write(buf);
-        self.digest.write(buf);
-        self.state_root.write(buf);
-        self.inactivity_floor.write(buf);
-        self.op_count.write(buf);
+        self.root_a.write(buf);
+        self.range_a.write(buf);
+        self.root_b.write(buf);
+        self.range_b.write(buf);
     }
 }
 
@@ -155,10 +98,10 @@ impl EncodeSize for Block {
         self.context.encode_size()
             + self.parent.encode_size()
             + self.height.encode_size()
-            + self.digest.encode_size()
-            + self.state_root.encode_size()
-            + self.inactivity_floor.encode_size()
-            + self.op_count.encode_size()
+            + self.root_a.encode_size()
+            + self.range_a.encode_size()
+            + self.root_b.encode_size()
+            + self.range_b.encode_size()
     }
 }
 
@@ -166,21 +109,14 @@ impl Read for Block {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        let context = Context::read(buf)?;
-        let parent = sha256::Digest::read(buf)?;
-        let height = Height::read(buf)?;
-        let digest = sha256::Digest::read(buf)?;
-        let state_root = sha256::Digest::read(buf)?;
-        let inactivity_floor = Location::read(buf)?;
-        let op_count = Location::read(buf)?;
         Ok(Self {
-            context,
-            parent,
-            height,
-            digest,
-            state_root,
-            inactivity_floor,
-            op_count,
+            context: Context::read(buf)?,
+            parent: sha256::Digest::read(buf)?,
+            height: Height::read(buf)?,
+            root_a: sha256::Digest::read(buf)?,
+            range_a: Range::read(buf)?,
+            root_b: sha256::Digest::read(buf)?,
+            range_b: Range::read(buf)?,
         })
     }
 }
@@ -189,7 +125,7 @@ impl Digestible for Block {
     type Digest = sha256::Digest;
 
     fn digest(&self) -> sha256::Digest {
-        self.digest
+        Sha256::hash(&self.encode())
     }
 }
 
@@ -215,7 +151,6 @@ impl CertifiableBlock for Block {
 
 impl Block {
     fn genesis() -> Self {
-        let digest = Sha256::hash(b"genesis");
         Self {
             context: Context {
                 round: Round::new(Epoch::zero(), View::zero()),
@@ -224,15 +159,18 @@ impl Block {
             },
             parent: sha256::Digest::EMPTY,
             height: Height::zero(),
-            digest,
-            state_root: sha256::Digest::EMPTY,
-            inactivity_floor: Location::new(0),
-            op_count: Location::new(1),
+            root_a: sha256::Digest::EMPTY,
+            range_a: Location::new(0)..Location::new(1),
+            root_b: sha256::Digest::EMPTY,
+            range_b: Location::new(0)..Location::new(1),
         }
     }
 }
 
-/// A stateful application that increments a counter each block.
+/// A stateful application that writes to two QMDB databases.
+///
+/// DB-A stores a counter incremented each block.
+/// DB-B stores height markers (height -> height_val).
 #[derive(Clone)]
 struct App {
     genesis: Block,
@@ -245,24 +183,37 @@ impl App {
         }
     }
 
-    /// Execute a block: increment "counter" and write `height -> height_val`.
+    /// Execute a block against two databases.
     async fn execute<E: Rng + Spawner + Metrics + Clock + Storage>(
         height: Height,
-        mut batches: <MockDatabaseSet<E> as DatabaseSet<E>>::Unmerkleized,
-    ) -> <MockDatabaseSet<E> as DatabaseSet<E>>::Merkleized {
-        // Read current counter
-        let current: u64 = batches
-            .get(&counter_key())
+        batches: (
+            <SingleDb<E> as DatabaseSet<E>>::Unmerkleized,
+            <SingleDb<E> as DatabaseSet<E>>::Unmerkleized,
+        ),
+    ) -> (
+        <SingleDb<E> as DatabaseSet<E>>::Merkleized,
+        <SingleDb<E> as DatabaseSet<E>>::Merkleized,
+    ) {
+        let (mut batch_a, mut batch_b) = batches;
+
+        // DB-A: increment counter
+        let counter = Sha256::hash(b"counter");
+        let current: u64 = batch_a
+            .get(&counter)
             .await
             .unwrap()
             .map_or(0, |v| digest_to_u64(&v));
-        let next = current + 1;
-        batches = batches.write(counter_key(), Some(u64_to_digest(next)));
+        batch_a = batch_a.write(counter, Some(u64_to_digest(current + 1)));
 
-        // Write height marker
-        batches = batches.write(height_key(height.get()), Some(u64_to_digest(height.get())));
+        // DB-B: write height marker
+        batch_b = batch_b.write(
+            Sha256::hash(&height.get().to_be_bytes()),
+            Some(u64_to_digest(height.get())),
+        );
 
-        batches.merkleize().await.unwrap()
+        let merkleized_a = batch_a.merkleize().await.unwrap();
+        let merkleized_b = batch_b.merkleize().await.unwrap();
+        (merkleized_a, merkleized_b)
     }
 }
 
@@ -270,7 +221,7 @@ impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
     type SigningScheme = MockScheme<ed25519::PublicKey>;
     type Context = Context<sha256::Digest, ed25519::PublicKey>;
     type Block = Block;
-    type Databases = MockDatabaseSet<E>;
+    type Databases = MultiDatabaseSet<E>;
     type InputProvider = ();
 
     async fn genesis(&mut self) -> Self::Block {
@@ -283,37 +234,23 @@ impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
         ancestry: AncestorStream<A, Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         _input: &mut Self::InputProvider,
-    ) -> Option<(Self::Block, <Self::Databases as DatabaseSet<E>>::Merkleized)> {
+    ) -> Option<Proposed<Self, E>> {
         let parent = ancestry.peek()?;
-        let parent_digest = parent.digest();
         let height = Height::new(parent.height().get() + 1);
-        let (_, ctx) = &context;
-
-        let merkleized = Self::execute(height, batches).await;
-        let state_root = merkleized.root();
-        let inactivity_floor = merkleized.inactivity_floor();
-        let op_count = merkleized.size();
-
-        let mut hasher = Sha256::new();
-        hasher.update(b"e2e_block");
-        hasher.update(&ctx.encode());
-        hasher.update(parent_digest.as_ref());
-        hasher.update(&height.get().to_be_bytes());
-        hasher.update(state_root.as_ref());
-        hasher.update(&(*inactivity_floor).to_be_bytes());
-        hasher.update(&(*op_count).to_be_bytes());
-        let digest = hasher.finalize();
-
+        let (merkleized_a, merkleized_b) = Self::execute(height, batches).await;
         let block = Block {
-            context: ctx.clone(),
-            parent: parent_digest,
+            context: context.1.clone(),
+            parent: parent.digest(),
             height,
-            digest,
-            state_root,
-            inactivity_floor,
-            op_count,
+            root_a: merkleized_a.root(),
+            range_a: merkleized_a.inactivity_floor()..merkleized_a.size(),
+            root_b: merkleized_b.root(),
+            range_b: merkleized_b.inactivity_floor()..merkleized_b.size(),
         };
-        Some((block, merkleized))
+        Some(Proposed {
+            block,
+            merkleized: (merkleized_a, merkleized_b),
+        })
     }
 
     async fn verify<A: BlockProvider<Block = Self::Block>>(
@@ -323,21 +260,15 @@ impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let tip = ancestry.peek()?;
-        let height = tip.height();
-
-        let merkleized = Self::execute(height, batches).await;
-        let computed_root = merkleized.root();
-        let computed_inactivity_floor = merkleized.inactivity_floor();
-        let computed_op_count = merkleized.size();
-
-        if computed_root != tip.state_root
-            || computed_inactivity_floor != tip.inactivity_floor
-            || computed_op_count != tip.op_count
-        {
+        let (merkleized_a, merkleized_b) = Self::execute(tip.height(), batches).await;
+        let matches_a = merkleized_a.root() == tip.root_a
+            && (merkleized_a.inactivity_floor()..merkleized_a.size()) == tip.range_a;
+        let matches_b = merkleized_b.root() == tip.root_b
+            && (merkleized_b.inactivity_floor()..merkleized_b.size()) == tip.range_b;
+        if !matches_a || !matches_b {
             return None;
         }
-
-        Some(merkleized)
+        Some((merkleized_a, merkleized_b))
     }
 
     async fn apply(
@@ -350,23 +281,29 @@ impl<E: Rng + Spawner + Metrics + Clock + Storage> Application<E> for App {
     }
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
-        Target {
-            root: block.state_root,
-            range: block.inactivity_floor..block.op_count,
-        }
+        (
+            Target {
+                root: block.root_a,
+                range: block.range_a.clone(),
+            },
+            Target {
+                root: block.root_b,
+                range: block.range_b.clone(),
+            },
+        )
     }
 }
 
-/// Engine definition implementing `EngineDefinition` for the simulation harness.
+/// Multi-database engine definition for the simulation harness.
 #[derive(Clone)]
-pub(crate) struct ConsensusEngine {
+pub(crate) struct MultiDbEngine {
     participants: Vec<ed25519::PublicKey>,
     schemes: Vec<MockScheme<ed25519::PublicKey>>,
     enable_late_join_state_sync: bool,
     marshal_mailboxes: Arc<Mutex<BTreeMap<ed25519::PublicKey, MarshalMailbox>>>,
 }
 
-impl ConsensusEngine {
+impl MultiDbEngine {
     pub(crate) fn new(n: u32) -> Self {
         let mut rng = test_rng();
         let Fixture {
@@ -387,91 +324,12 @@ impl ConsensusEngine {
         self.enable_late_join_state_sync = true;
         self
     }
-
-    async fn fetch_majority_sync_target(
-        &self,
-        context: &impl Clock,
-        me: &ed25519::PublicKey,
-    ) -> Option<Block> {
-        for _ in 0..20 {
-            let mailboxes = {
-                let guard = self.marshal_mailboxes.lock();
-                guard
-                    .iter()
-                    .filter(|(peer, _)| *peer != me)
-                    .map(|(peer, mailbox)| (peer.clone(), mailbox.clone()))
-                    .collect::<Vec<_>>()
-            };
-
-            if mailboxes.is_empty() {
-                context.sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-
-            let mut latest_heights = Vec::new();
-            for (_peer, mailbox) in mailboxes {
-                if let Some((height, _)) = mailbox.get_info(MarshalIdentifier::Latest).await {
-                    latest_heights.push((mailbox, height));
-                }
-            }
-
-            if latest_heights.is_empty() {
-                context.sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-
-            let required = latest_heights.len() / 2 + 1;
-
-            // Pick a height that at least `required` peers have reached.
-            let mut heights: Vec<Height> = latest_heights.iter().map(|(_, h)| *h).collect();
-            heights.sort();
-            let quorum_height = heights[heights.len() - required];
-
-            let mut digest_counts: HashMap<sha256::Digest, usize> = HashMap::new();
-            let mut digest_candidates: HashMap<sha256::Digest, Vec<MarshalMailbox>> =
-                HashMap::new();
-            for (mailbox, latest_height) in latest_heights {
-                if latest_height < quorum_height {
-                    continue;
-                }
-                if let Some((_, digest)) = mailbox
-                    .get_info(MarshalIdentifier::Height(quorum_height))
-                    .await
-                {
-                    *digest_counts.entry(digest).or_insert(0) += 1;
-                    digest_candidates.entry(digest).or_default().push(mailbox);
-                }
-            }
-
-            let majority_digest = digest_counts
-                .into_iter()
-                .filter(|(_, count)| *count >= required)
-                .max_by_key(|(_, count)| *count)
-                .map(|(digest, _)| digest);
-
-            if let Some(digest) = majority_digest {
-                if let Some(mailboxes) = digest_candidates.get(&digest) {
-                    for mailbox in mailboxes {
-                        if let Some(block) =
-                            mailbox.get_block(MarshalIdentifier::Digest(digest)).await
-                        {
-                            return Some(block);
-                        }
-                    }
-                }
-            }
-
-            context.sleep(Duration::from_millis(100)).await;
-        }
-
-        None
-    }
 }
 
-impl EngineDefinition for ConsensusEngine {
+impl EngineDefinition for MultiDbEngine {
     type PublicKey = ed25519::PublicKey;
     type Engine = Handle<()>;
-    type State = MockValidatorState;
+    type State = MockValidatorState<Standard<Block>>;
 
     fn participants(&self) -> Vec<Self::PublicKey> {
         self.participants.clone()
@@ -484,7 +342,7 @@ impl EngineDefinition for ConsensusEngine {
             (2, TEST_QUOTA), // resolver
             (3, TEST_QUOTA), // backfill
             (4, TEST_QUOTA), // broadcast
-            (5, TEST_QUOTA), // qmdb sync resolver
+            (5, TEST_QUOTA), // qmdb sync resolvers (muxed)
         ]
     }
 
@@ -504,19 +362,32 @@ impl EngineDefinition for ConsensusEngine {
         let partition_prefix = format!("validator-{index}");
         let page_cache = CacheRef::from_pooler(&context, PAGE_SIZE, PAGE_CACHE_SIZE);
 
-        // QMDB database config (created by Stateful::start)
-        let db_config = FixedConfig {
-            mmr_journal_partition: format!("{partition_prefix}-qmdb-mmr-journal"),
-            mmr_metadata_partition: format!("{partition_prefix}-qmdb-mmr-metadata"),
+        // QMDB database configs (one per database)
+        let db_config_a = FixedConfig {
+            mmr_journal_partition: format!("{partition_prefix}-qmdb-a-mmr-journal"),
+            mmr_metadata_partition: format!("{partition_prefix}-qmdb-a-mmr-metadata"),
             mmr_items_per_blob: NZU64!(11),
             mmr_write_buffer: IO_BUFFER_SIZE,
-            log_journal_partition: format!("{partition_prefix}-qmdb-log-journal"),
+            log_journal_partition: format!("{partition_prefix}-qmdb-a-log-journal"),
             log_items_per_blob: NZU64!(7),
             log_write_buffer: IO_BUFFER_SIZE,
             translator: TwoCap,
             thread_pool: None,
             page_cache: page_cache.clone(),
         };
+        let db_config_b = FixedConfig {
+            mmr_journal_partition: format!("{partition_prefix}-qmdb-b-mmr-journal"),
+            mmr_metadata_partition: format!("{partition_prefix}-qmdb-b-mmr-metadata"),
+            mmr_items_per_blob: NZU64!(11),
+            mmr_write_buffer: IO_BUFFER_SIZE,
+            log_journal_partition: format!("{partition_prefix}-qmdb-b-log-journal"),
+            log_items_per_blob: NZU64!(7),
+            log_write_buffer: IO_BUFFER_SIZE,
+            translator: TwoCap,
+            thread_pool: None,
+            page_cache: page_cache.clone(),
+        };
+        let db_config = (db_config_a, db_config_b);
 
         // Destructure the 6 channels.
         let mut channels = channels.into_iter();
@@ -526,6 +397,17 @@ impl EngineDefinition for ConsensusEngine {
         let backfill_network = channels.next().unwrap();
         let broadcast_network = channels.next().unwrap();
         let qmdb_resolver_network = channels.next().unwrap();
+
+        // Mux the QMDB resolver channel into two subchannels (one per database).
+        let (mux, mut mux_handle) = Muxer::new(
+            context.with_label("qmdb_mux"),
+            qmdb_resolver_network.0,
+            qmdb_resolver_network.1,
+            100,
+        );
+        mux.start();
+        let qmdb_a_resolver_network = mux_handle.register(0).await.unwrap();
+        let qmdb_b_resolver_network = mux_handle.register(1).await.unwrap();
 
         // Marshal resolver
         let resolver_cfg = marshal_resolver::Config {
@@ -556,51 +438,13 @@ impl EngineDefinition for ConsensusEngine {
         // Immutable archives
         let finalizations_by_height = immutable::Archive::init(
             context.with_label("finalizations_by_height"),
-            immutable::Config {
-                metadata_partition: format!("{partition_prefix}-finalizations-metadata"),
-                freezer_table_partition: format!("{partition_prefix}-finalizations-freezer-table"),
-                freezer_table_initial_size: 64,
-                freezer_table_resize_frequency: 10,
-                freezer_table_resize_chunk_size: 10,
-                freezer_key_partition: format!("{partition_prefix}-finalizations-freezer-key"),
-                freezer_key_page_cache: page_cache.clone(),
-                freezer_value_partition: format!("{partition_prefix}-finalizations-freezer-value"),
-                freezer_value_target_size: 1024,
-                freezer_value_compression: None,
-                ordinal_partition: format!("{partition_prefix}-finalizations-ordinal"),
-                items_per_section: NZU64!(10),
-                codec_config: MockScheme::<ed25519::PublicKey>::certificate_codec_config_unbounded(
-                ),
-                replay_buffer: IO_BUFFER_SIZE,
-                freezer_key_write_buffer: IO_BUFFER_SIZE,
-                freezer_value_write_buffer: IO_BUFFER_SIZE,
-                ordinal_write_buffer: IO_BUFFER_SIZE,
-            },
+            archive_config(&partition_prefix, "finalizations", page_cache.clone(), ()),
         )
         .await
         .expect("failed to initialize finalizations archive");
-
         let finalized_blocks = immutable::Archive::init(
             context.with_label("finalized_blocks"),
-            immutable::Config {
-                metadata_partition: format!("{partition_prefix}-blocks-metadata"),
-                freezer_table_partition: format!("{partition_prefix}-blocks-freezer-table"),
-                freezer_table_initial_size: 64,
-                freezer_table_resize_frequency: 10,
-                freezer_table_resize_chunk_size: 10,
-                freezer_key_partition: format!("{partition_prefix}-blocks-freezer-key"),
-                freezer_key_page_cache: page_cache.clone(),
-                freezer_value_partition: format!("{partition_prefix}-blocks-freezer-value"),
-                freezer_value_target_size: 1024,
-                freezer_value_compression: None,
-                ordinal_partition: format!("{partition_prefix}-blocks-ordinal"),
-                items_per_section: NZU64!(10),
-                codec_config: (),
-                replay_buffer: IO_BUFFER_SIZE,
-                freezer_key_write_buffer: IO_BUFFER_SIZE,
-                freezer_value_write_buffer: IO_BUFFER_SIZE,
-                ordinal_write_buffer: IO_BUFFER_SIZE,
-            },
+            archive_config(&partition_prefix, "blocks", page_cache.clone(), ()),
         )
         .await
         .expect("failed to initialize blocks archive");
@@ -635,10 +479,10 @@ impl EngineDefinition for ConsensusEngine {
             .lock()
             .insert(public_key.clone(), marshal_mailbox.clone());
 
-        // QMDB state-sync resolver.
-        let qmdb_resolver_actor =
-            qmdb_resolver::Actor::<_, ed25519::PublicKey, _, _, Qmdb<_>, _, _>::new(
-                context.clone().with_label("qmdb_resolver"),
+        // QMDB state-sync resolvers (one per database).
+        let (qmdb_resolver_actor_a, qmdb_sync_resolver_a) =
+            qmdb_resolver::Actor::<_, ed25519::PublicKey, _, _, Qmdb<_>>::new(
+                context.with_label("qmdb_resolver_a"),
                 qmdb_resolver::Config {
                     peer_provider: oracle.manager(),
                     blocker: oracle.control(public_key.clone()),
@@ -652,11 +496,28 @@ impl EngineDefinition for ConsensusEngine {
                     priority_responses: false,
                 },
             );
-        let (_qmdb_resolver_handle, qmdb_sync_resolver) =
-            qmdb_resolver_actor.start(qmdb_resolver_network);
+        qmdb_resolver_actor_a.start(qmdb_a_resolver_network);
+
+        let (qmdb_resolver_actor_b, qmdb_sync_resolver_b) =
+            qmdb_resolver::Actor::<_, ed25519::PublicKey, _, _, Qmdb<_>>::new(
+                context.with_label("qmdb_resolver_b"),
+                qmdb_resolver::Config {
+                    peer_provider: oracle.manager(),
+                    blocker: oracle.control(public_key.clone()),
+                    database: None,
+                    mailbox_size: 100,
+                    me: Some(public_key.clone()),
+                    initial: Duration::from_secs(1),
+                    timeout: Duration::from_secs(2),
+                    fetch_retry_timeout: Duration::from_millis(100),
+                    priority_requests: false,
+                    priority_responses: false,
+                },
+            );
+        qmdb_resolver_actor_b.start(qmdb_b_resolver_network);
 
         let (startup, startup_sync_height) = if self.enable_late_join_state_sync {
-            self.fetch_majority_sync_target(&context, public_key)
+            fetch_majority_sync_target(&self.marshal_mailboxes, &context, public_key)
                 .await
                 .map_or((Startup::Fresh, None), |block| {
                     let height = block.height().get();
@@ -679,7 +540,7 @@ impl EngineDefinition for ConsensusEngine {
                 state_sync: StateSyncConfig {
                     partition_prefix: partition_prefix.clone(),
                     startup,
-                    resolvers: qmdb_sync_resolver.clone(),
+                    resolvers: (qmdb_sync_resolver_a.clone(), qmdb_sync_resolver_b.clone()),
                     sync_config: SyncEngineConfig {
                         fetch_batch_size: NZU64!(16),
                         apply_batch_size: 64,

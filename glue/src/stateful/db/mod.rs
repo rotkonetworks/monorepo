@@ -303,8 +303,44 @@ where
 /// Implement [`DatabaseSet`] for a tuple of individually-locked
 /// [`ManagedDb`] instances.
 macro_rules! impl_database_set {
+    // Single-database tuple: no label needed.
+    ($T:ident : $idx:tt) => {
+        impl<E: Clone + Send + Sync, $T: ManagedDb<E> + 'static> DatabaseSet<E>
+            for (Arc<AsyncRwLock<$T>>,)
+        {
+            type Unmerkleized = ($T::Unmerkleized,);
+            type Merkleized = ($T::Merkleized,);
+            type Config = ($T::Config,);
+            type SyncTargets = ($T::SyncTarget,);
+
+            async fn init(context: E, config: Self::Config) -> Self {
+                let db = $T::init(context, config.0)
+                    .await
+                    .expect(concat!(
+                        "database init failed (index 0, type ",
+                        stringify!($T),
+                        ")",
+                    ));
+                (Arc::new(AsyncRwLock::new(db)),)
+            }
+
+            async fn new_batches(&self) -> Self::Unmerkleized {
+                ($T::new_batch(&self.0).await,)
+            }
+
+            fn fork_batches(parent: &Self::Merkleized) -> Self::Unmerkleized {
+                (parent.0.new_batch(),)
+            }
+
+            async fn finalize(&self, batches: Self::Merkleized) {
+                let mut database = self.0.write().await;
+                finalize_or_panic(&mut *database, batches.0, Some(0)).await;
+            }
+        }
+    };
+    // Multi-database tuple: adds per-database labels to avoid metric collisions.
     ($($T:ident : $idx:tt),+) => {
-        impl<E: Clone + Send + Sync, $($T: ManagedDb<E> + 'static),+> DatabaseSet<E>
+        impl<E: Clone + Send + Sync + Metrics, $($T: ManagedDb<E> + 'static),+> DatabaseSet<E>
             for ($(Arc<AsyncRwLock<$T>>,)+)
         {
             type Unmerkleized = ($($T::Unmerkleized,)+);
@@ -315,7 +351,10 @@ macro_rules! impl_database_set {
             async fn init(context: E, config: Self::Config) -> Self {
                 let result = join!($(
                     async {
-                        let db = $T::init(context.clone(), config.$idx)
+                        let db = $T::init(
+                                context.clone().with_label(concat!("db_", stringify!($idx))),
+                                config.$idx,
+                            )
                             .await
                             .expect(concat!(
                                 "database init failed (index ",
@@ -404,7 +443,7 @@ macro_rules! impl_state_sync_set {
                     $(
                         async {
                             $T::sync_db(
-                                context.clone(),
+                                context.clone().with_label(concat!("db_", stringify!($idx))),
                                 config.$idx,
                                 resolvers.$idx,
                                 targets.$idx,
@@ -484,6 +523,7 @@ async fn finalize_or_panic<E, T: ManagedDb<E>>(
 mod tests {
     use super::{DatabaseSet, ManagedDb, Merkleized, Unmerkleized};
     use commonware_cryptography::sha256;
+    use commonware_runtime::{deterministic, Runner as _};
     use commonware_utils::{channel::oneshot, sync::AsyncRwLock};
     use futures::{pin_mut, FutureExt};
     use std::{convert::Infallible, sync::Arc};
@@ -616,7 +656,7 @@ mod tests {
 
     #[test]
     fn tuple_new_batches_queues_reads_concurrently() {
-        futures::executor::block_on(async move {
+        deterministic::Runner::default().start(|_context| async move {
             let db1 = Arc::new(AsyncRwLock::new(TestDb));
             let db2 = Arc::new(AsyncRwLock::new(TestDb));
             let databases = (db1.clone(), db2.clone());
@@ -625,7 +665,9 @@ mod tests {
             let writer2 = db2.write().await;
 
             let new_batches =
-                <(Arc<AsyncRwLock<TestDb>>, Arc<AsyncRwLock<TestDb>>) as DatabaseSet<()>>::new_batches(&databases);
+                <(Arc<AsyncRwLock<TestDb>>, Arc<AsyncRwLock<TestDb>>) as DatabaseSet<
+                    deterministic::Context,
+                >>::new_batches(&databases);
             pin_mut!(new_batches);
             assert!(new_batches.as_mut().now_or_never().is_none());
 
@@ -646,7 +688,7 @@ mod tests {
 
     #[test]
     fn tuple_finalize_runs_databases_in_parallel() {
-        futures::executor::block_on(async move {
+        deterministic::Runner::default().start(|_context| async move {
             let (started1_tx, started1_rx) = oneshot::channel();
             let (started2_tx, started2_rx) = oneshot::channel();
             let (release1_tx, release1_rx) = oneshot::channel();
@@ -666,8 +708,9 @@ mod tests {
             let finalize = <(
                 Arc<AsyncRwLock<BlockingFinalizeDb>>,
                 Arc<AsyncRwLock<BlockingFinalizeDb>>,
-            ) as DatabaseSet<()>>::finalize(
-                &databases, (TestMerkleized, TestMerkleized)
+            ) as DatabaseSet<deterministic::Context>>::finalize(
+                &databases,
+                (TestMerkleized, TestMerkleized),
             );
             pin_mut!(finalize);
             assert!(finalize.as_mut().now_or_never().is_none());
@@ -691,7 +734,7 @@ mod tests {
     #[test]
     fn tuple_finalize_panic_identifies_failing_database() {
         let panic = std::panic::catch_unwind(|| {
-            futures::executor::block_on(async move {
+            deterministic::Runner::default().start(|_context| async move {
                 let databases = (
                     Arc::new(AsyncRwLock::new(TestDb)),
                     Arc::new(AsyncRwLock::new(FailingFinalizeDb)),
@@ -699,8 +742,9 @@ mod tests {
                 <(
                     Arc<AsyncRwLock<TestDb>>,
                     Arc<AsyncRwLock<FailingFinalizeDb>>,
-                ) as DatabaseSet<()>>::finalize(
-                    &databases, (TestMerkleized, TestMerkleized)
+                ) as DatabaseSet<deterministic::Context>>::finalize(
+                    &databases,
+                    (TestMerkleized, TestMerkleized),
                 )
                 .await;
             });
