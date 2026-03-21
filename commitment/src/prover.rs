@@ -208,6 +208,11 @@ where
             let coeffs = compute_sumcheck_coefficients(&current_poly);
             sumcheck_transcript.push(coeffs);
 
+            // Absorb round polynomial into Fiat-Shamir before squeezing challenge.
+            transcript.absorb_elem(coeffs.0);
+            transcript.absorb_elem(coeffs.1);
+            transcript.absorb_elem(coeffs.2);
+
             let ri: U = transcript.challenge();
             rs.push(ri);
 

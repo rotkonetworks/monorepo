@@ -176,6 +176,11 @@ where
                 return Ok(false);
             }
 
+            // Absorb round polynomial into Fiat-Shamir before squeezing challenge.
+            fs.absorb_elem(coeffs.0);
+            fs.absorb_elem(coeffs.1);
+            fs.absorb_elem(coeffs.2);
+
             let ri = fs.challenge::<U>();
             rs.push(ri);
             current_sum = evaluate_quadratic(coeffs, ri);

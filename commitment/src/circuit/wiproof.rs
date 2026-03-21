@@ -72,8 +72,10 @@ impl ZkProver {
         let target_size = 1usize << target_log_size;
         poly.resize(target_size, BinaryElem32::zero());
 
-        // Generate proof.
+        // Generate proof. Bind public inputs to the Fiat-Shamir transcript
+        // so the proof is tied to these specific inputs.
         let mut transcript = Sha256Transcript::new(1234);
+        transcript.absorb_bytes(b"public_inputs", &public_inputs_bytes(&instance.public_inputs));
         let proof = crate::prove(&config, &poly, &mut transcript)?;
 
         // Compute batching challenge from public inputs.
@@ -123,8 +125,13 @@ impl ZkVerifier {
         // Get appropriate config.
         let config = crate::verifier_config_for_log_size(log_size);
 
-        // Verify proof.
+        // Verify proof. Must absorb the same public inputs the prover did.
         let mut transcript = Sha256Transcript::new(1234);
+        let pi_elems: Vec<BinaryElem32> = expected_public_inputs
+            .iter()
+            .map(|&v| BinaryElem32::from(v))
+            .collect();
+        transcript.absorb_bytes(b"public_inputs", &public_inputs_bytes(&pi_elems));
         crate::verify(&config, &proof.commitment_proof, &mut transcript)
     }
 }
@@ -133,6 +140,15 @@ impl Default for ZkVerifier {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Serialize public inputs to bytes for Fiat-Shamir absorption.
+fn public_inputs_bytes(public_inputs: &[BinaryElem32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(public_inputs.len() * 4);
+    for input in public_inputs {
+        bytes.extend_from_slice(&input.poly().value().to_le_bytes());
+    }
+    bytes
 }
 
 /// Compute batching challenge from public inputs.
@@ -194,6 +210,7 @@ pub fn prove_from_block(
     };
 
     let mut transcript = Sha256Transcript::new(1234);
+    transcript.absorb_bytes(b"public_inputs", &public_inputs_bytes(&instance.public_inputs));
     let root_bytes = cm_0
         .root
         .root
