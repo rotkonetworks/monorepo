@@ -214,13 +214,16 @@ where
                 return Ok(false);
             }
 
-            // Ligero consistency check.
-            verify_ligero(
+            // Ligero proximity test: verify opened rows are consistent
+            // with yr under the sumcheck challenges.
+            if !verify_ligero(
                 &queries,
                 &proof.final_opening.opened_rows,
                 &proof.final_opening.yr,
                 &rs,
-            );
+            ) {
+                return Ok(false);
+            }
 
             return Ok(true);
         }

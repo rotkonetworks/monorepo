@@ -16,6 +16,9 @@ pub mod witness;
 pub mod wiproof;
 
 pub use constraint::{Circuit, CircuitBuilder, Constraint, Operand, ShiftOp, Witness, WireId};
-pub use threshold::{build_threshold_circuit, build_threshold_witness, verify_threshold};
+pub use threshold::{
+    build_threshold_circuit, build_threshold_witness, check_threshold, verify_threshold,
+    ThresholdWires,
+};
 pub use witness::{ConstraintPolynomial, LigeritoInstance, WitnessPolynomial};
 pub use wiproof::{prove_and_verify, prove_from_block, ZkProof, ZkProver, ZkVerifier};
