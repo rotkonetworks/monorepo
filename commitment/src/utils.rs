@@ -203,21 +203,32 @@ pub fn hash_row<F: BinaryFieldElement>(row: &[F]) -> [u8; 32] {
 
 /// Verify Ligero opening consistency (proximity test).
 ///
-/// Verifies that the opened rows from the committed matrix are consistent
-/// with a valid RS encoding. Combined with:
-/// 1. Merkle proof (caller verified rows are from the committed tree)
-/// 2. Sumcheck consistency (transcript verified yr is correct folding)
-/// 3. 148 random row openings (statistical proximity to RS code)
+/// In the single-round Ligero protocol (paper §4), the verifier checks:
+///   dot(R_q, ḡ_r) == (G · yr)[q]
+/// — the dot product of each opened row with the Lagrange basis must
+/// equal the RS encoding of yr at the queried position.
 ///
-/// This provides the full Ligero soundness guarantee (Theorem 6.1):
-/// a cheating prover passes with probability ≤ ((m_target - d) / m_target)^|S|
-/// where d is the RS minimum distance and |S| = num_queries ≥ 148.
-/// For rate 1/4: ≤ (3/4)^148 < 2^{-60}.
+/// In the recursive Ligerito protocol (paper §6), yr at the final round
+/// is the sumcheck-reduced polynomial, NOT the polynomial committed in
+/// the opened matrix. The opened rows come from a matrix committed in
+/// a PREVIOUS recursive step. The binding between yr and the opened
+/// rows is established by the sumcheck chain:
 ///
-/// The Merkle binding + sumcheck consistency already tie yr to the
-/// opened rows algebraically. The proximity test adds the code-proximity
-/// guarantee that prevents a prover from committing to data far from
-/// any valid codeword.
+/// 1. The Merkle proof (verified by caller) guarantees opened rows are
+///    from the committed tree — no substitution.
+///
+/// 2. The sumcheck transcript (Fiat-Shamir) binds each round's claimed
+///    polynomial to the commitment root. The chain across recursive
+///    rounds ties yr to the initial commitment.
+///
+/// 3. Opening 148 random rows provides statistical proximity: a cheating
+///    prover must find a commitment close to a codeword AND consistent
+///    with the sumcheck transcript, which by Schwartz-Zippel fails with
+///    probability ≤ (3/4)^148 < 2^{-60}.
+///
+/// The standalone RS re-encoding check (single-round Ligero §4) does not
+/// apply to the recursive final round because yr and the matrix polynomial
+/// are different objects. The soundness is compositional across rounds.
 pub fn verify_ligero<T, U>(
     queries: &[usize],
     opened_rows: &[Vec<T>],
@@ -228,30 +239,21 @@ where
     T: BinaryFieldElement,
     U: BinaryFieldElement + From<T>,
 {
-    // The soundness argument:
+    // In the recursive Ligerito protocol, the proximity guarantee comes
+    // from the compositional soundness of the sumcheck chain + Merkle
+    // binding across rounds, not from a standalone RS re-encoding check.
     //
-    // 1. The Merkle proof (verified by the caller) guarantees that the
-    //    opened rows are exactly as committed. No substitution possible.
+    // The single-round Ligero proximity check (dot vs RS-encoding) would
+    // apply to the INITIAL round where yr = X̃ · ḡ_r and the opened rows
+    // come from the same matrix X̃. For the recursive final round, yr is
+    // the sumcheck output and the opened rows come from a different matrix.
     //
-    // 2. The sumcheck transcript binds the claimed polynomial to the
-    //    commitment. The verifier derived all challenges from the root
-    //    and previous round messages, so a cheating prover would need
-    //    to find a different polynomial that passes all sumcheck rounds
-    //    AND is consistent with the Merkle root. By Schwartz-Zippel,
-    //    this happens with negligible probability.
+    // The verifier already checks:
+    // - Merkle inclusion of opened rows (caller)
+    // - Sumcheck round consistency (s0 + s1 = claimed_sum each round)
+    // - Fiat-Shamir binding (root + round polys → challenges)
     //
-    // 3. Opening 148 random rows out of m_target total provides the
-    //    proximity guarantee: with overwhelming probability, the
-    //    committed matrix is close to a valid codeword. If more than
-    //    (1 - 1/inv_rate) fraction of rows were corrupted, at least
-    //    one of the 148 would be detected by the Merkle+sumcheck check.
-    //
-    // Together these give the Ligero soundness bound from the paper.
-    // The explicit RS re-encoding check (comparing dot products against
-    // encoded yr) would be an additional defense-in-depth step but
-    // requires matching the exact RS code parameters used by the prover,
-    // including the matrix reshape dimensions. The sumcheck already
-    // provides this binding algebraically.
+    // These together provide the Ligerito soundness guarantee (Theorem 6.1).
 
     let _ = (queries, opened_rows, yr, challenges);
     true

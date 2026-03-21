@@ -23,8 +23,8 @@ fn induce_sumcheck<T, U>(
     alpha: U,
 ) -> (Vec<U>, U)
 where
-    T: BinaryFieldElement + Send + Sync,
-    U: BinaryFieldElement + Send + Sync + From<T>,
+    T: BinaryFieldElement + Send + Sync + 'static,
+    U: BinaryFieldElement + Send + Sync + From<T> + 'static,
 {
     crate::sumcheck::polys::induce_sumcheck_poly_parallel(
         n,
@@ -73,8 +73,8 @@ pub fn verify<T, U>(
     transcript: &mut impl crate::Transcript,
 ) -> crate::Result<bool>
 where
-    T: BinaryFieldElement + Send + Sync,
-    U: BinaryFieldElement + Send + Sync + From<T>,
+    T: BinaryFieldElement + Send + Sync + 'static,
+    U: BinaryFieldElement + Send + Sync + From<T> + 'static,
 {
     let root_bytes = proof
         .initial_commitment
@@ -94,8 +94,8 @@ fn verify_core<T, U>(
     fs: &mut impl crate::Transcript,
 ) -> crate::Result<bool>
 where
-    T: BinaryFieldElement + Send + Sync,
-    U: BinaryFieldElement + Send + Sync + From<T>,
+    T: BinaryFieldElement + Send + Sync + 'static,
+    U: BinaryFieldElement + Send + Sync + From<T> + 'static,
 {
     // Precompute basis evaluations once.
     let cached_initial_sks: Vec<T> = eval_sk_at_vks(1 << config.initial_dim);
